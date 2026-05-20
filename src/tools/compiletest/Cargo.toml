@@ -15,7 +15,7 @@ test = false
 
 [dependencies]
 # tidy-alphabetical-start
-anstyle-svg = "0.1.11"
+anstyle-svg = "1.1.0"
 build_helper = { path = "../../build_helper" }
 camino = "1"
 colored = "3"
