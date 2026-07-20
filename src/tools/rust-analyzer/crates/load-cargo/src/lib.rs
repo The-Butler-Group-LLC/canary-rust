@@ -11,16 +11,15 @@ extern crate rustc_driver as _;
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
 use crossbeam_channel::{Receiver, unbounded};
-use hir_expand::{
-    db::ExpandDatabase,
-    proc_macro::{
-        ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
-        ProcMacrosBuilder,
-    },
+use hir_expand::proc_macro::{
+    ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
+    ProcMacrosBuilder,
 };
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, RootDatabase,
-    base_db::{CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot, SourceRootId},
+    base_db::{
+        CrateGraphBuilder, Env, ProcMacroLoadingError, SourceDatabase, SourceRoot, SourceRootId,
+    },
     prime_caches,
 };
 use itertools::Itertools;
@@ -171,7 +170,7 @@ pub fn load_workspace_into_db(
             .map(|(crate_id, path)| {
                 (
                     crate_id,
-                    path.map_or_else(Err, |(_, path)| {
+                    path.and_then(|(_, path)| {
                         proc_macro_server.as_ref().map_err(Clone::clone).and_then(
                             |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
                         )
@@ -569,7 +568,7 @@ struct Expander(proc_macro_api::ProcMacro);
 impl ProcMacroExpander for Expander {
     fn expand(
         &self,
-        db: &dyn ExpandDatabase,
+        db: &dyn SourceDatabase,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -609,11 +608,9 @@ impl ProcMacroExpander for Expander {
             SubRequest::LineColumn { file_id, ast_id, offset } => {
                 let range =
                     resolve_sub_span(db, file_id, ast_id, TextRange::empty(TextSize::from(offset)));
-                let source = db.file_text(range.file_id.file_id(db)).text(db);
-                let line_index = ide_db::line_index::LineIndex::new(source);
-                let (line, column) = line_index
-                    .try_line_col(range.range.start())
-                    .map(|lc| (lc.line + 1, lc.col + 1))
+                let (line, column) = db
+                    .line_column(range.file_id.file_id(db), range.range.start())
+                    .map(|(line, col)| (line + 1, col + 1))
                     .unwrap_or((1, 1));
                 // proc_macro::Span line/column are 1-based
                 Ok(SubResponse::LineColumnResult { line, column })
@@ -657,11 +654,11 @@ impl ProcMacroExpander for Expander {
                 let mut current_ctx = span.ctx;
 
                 while let Some(macro_call_id) = current_ctx.outer_expn(db) {
-                    let macro_call_loc = db.lookup_intern_macro_call(macro_call_id.into());
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
 
                     let call_site_file = macro_call_loc.kind.file_id();
 
-                    let resolved = db.resolve_span(current_span);
+                    let resolved = hir_expand::resolve_span(db, current_span);
 
                     current_ctx = macro_call_loc.ctxt;
                     current_span = Span {
@@ -678,7 +675,7 @@ impl ProcMacroExpander for Expander {
                     }
                 }
 
-                let resolved = db.resolve_span(current_span);
+                let resolved = hir_expand::resolve_span(db, current_span);
 
                 Ok(SubResponse::SpanSourceResult {
                     file_id: resolved.file_id.span_file_id(db).as_u32(),
@@ -701,14 +698,14 @@ impl ProcMacroExpander for Expander {
                 };
 
                 if let Some(macro_call_id) = span.ctx.outer_expn(db) {
-                    let macro_call_loc = db.lookup_intern_macro_call(macro_call_id.into());
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
 
                     let call_site_file = macro_call_loc.kind.file_id();
                     let call_site_ast_id = macro_call_loc.kind.erased_ast_id();
 
                     if let Some(editioned_file_id) = call_site_file.file_id() {
-                        let range = db
-                            .ast_id_map(editioned_file_id.into())
+                        let range = hir_expand::HirFileId::from(editioned_file_id)
+                            .ast_id_map(db)
                             .get_erased(call_site_ast_id)
                             .text_range();
 
@@ -726,6 +723,8 @@ impl ProcMacroExpander for Expander {
 
                 Ok(SubResponse::SpanParentResult { parent_span: None })
             }
+            // FIXME: implement this
+            SubRequest::SpanJoin { .. } => Ok(SubResponse::SpanJoinResult { span: None }),
         };
         match self.0.expand(
             subtree.view(),
@@ -749,7 +748,7 @@ impl ProcMacroExpander for Expander {
 }
 
 fn resolve_sub_span(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     file_id: u32,
     ast_id: u32,
     range: TextRange,
@@ -761,7 +760,7 @@ fn resolve_sub_span(
         anchor: SpanAnchor { file_id: editioned_file_id, ast_id },
         ctx: SyntaxContext::root(editioned_file_id.edition()),
     };
-    db.resolve_span(span)
+    hir_expand::resolve_span(db, span)
 }
 
 #[cfg(test)]

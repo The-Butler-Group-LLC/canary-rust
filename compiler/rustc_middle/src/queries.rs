@@ -64,11 +64,9 @@ use rustc_errors::{ErrorGuaranteed, catch_fatal_errors};
 use rustc_hir as hir;
 use rustc_hir::attrs::{EiiDecl, EiiImpl, StrippedCfgItem};
 use rustc_hir::def::{DefKind, DocLinkResMap};
-use rustc_hir::def_id::{
-    CrateNum, DefId, DefIdMap, LocalDefId, LocalDefIdMap, LocalDefIdSet, LocalModDefId,
-};
+use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LocalDefIdSet, LocalModId};
 use rustc_hir::lang_items::{LangItem, LanguageItems};
-use rustc_hir::{ItemLocalId, ItemLocalMap, PreciseCapturingArgKind, TraitCandidate};
+use rustc_hir::{ItemLocalId, PreciseCapturingArgKind};
 use rustc_index::IndexVec;
 use rustc_lint_defs::LintId;
 use rustc_macros::rustc_queries;
@@ -77,16 +75,16 @@ use rustc_session::config::{EntryFnType, OptLevel, OutputFilenames, SymbolMangli
 use rustc_session::cstore::{
     CrateDepKind, CrateSource, ExternCrate, ForeignModule, LinkagePreference, NativeLib,
 };
-use rustc_session::lint::LintExpectationId;
-use rustc_span::def_id::LOCAL_CRATE;
+use rustc_session::lint::StableLintExpectationId;
+use rustc_span::def_id::{LOCAL_CRATE, ModId};
 use rustc_span::{DUMMY_SP, LocalExpnId, Span, Spanned, Symbol};
 use rustc_target::spec::PanicStrategy;
 
-use crate::hir::Crate;
 use crate::infer::canonical::{self, Canonical};
 use crate::lint::LintExpectation;
 use crate::metadata::ModChild;
 use crate::middle::codegen_fn_attrs::{CodegenFnAttrs, SanitizerFnAttrs};
+use crate::middle::dead_code::DeadCodeLivenessSummary;
 use crate::middle::debugger_visualizer::DebuggerVisualizerFile;
 use crate::middle::deduced_param_attrs::DeducedParamAttrs;
 use crate::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo};
@@ -181,10 +179,29 @@ rustc_queries! {
         desc { "getting the resolver outputs" }
     }
 
-    query resolver_for_lowering_raw(_: ()) -> (&'tcx Steal<(ty::ResolverAstLowering<'tcx>, Arc<ast::Crate>)>, &'tcx ty::ResolverGlobalCtxt) {
+    query resolver_for_lowering_raw(_: ()) -> (
+        // Those two fields are consumed by `index_ast`.
+        // We want them to be eventually dropped after lowering.
+        &'tcx Steal<ty::ResolverAstLowering<'tcx>>,
+        &'tcx Steal<ast::Crate>,
+        &'tcx ty::ResolverGlobalCtxt,
+    ) {
         eval_always
         no_hash
         desc { "getting the resolver for lowering" }
+    }
+
+    query index_ast(_: ()) -> &'tcx IndexVec<LocalDefId, Steal<(
+        // There is only a single `ResolverAstLowering` for all owners.
+        // We want to drop it once the whole HIR has been lowered.
+        // We rely on reference counting to know when all definitions have been stolen.
+        Arc<ty::ResolverAstLowering<'tcx>>,
+        ast::AstOwner,
+    )>> {
+        arena_cache
+        eval_always
+        no_hash
+        desc { "getting the AST for lowering" }
     }
 
     /// Return the span for a definition.
@@ -198,27 +215,14 @@ rustc_queries! {
         desc { "getting the source span" }
     }
 
-    /// Represents crate as a whole (as distinct from the top-level crate module).
-    ///
-    /// If you call `tcx.hir_crate(())` we will have to assume that any change
-    /// means that you need to be recompiled. This is because the `hir_crate`
-    /// query gives you access to all other items. To avoid this fate, do not
-    /// call `tcx.hir_crate(())`; instead, prefer wrappers like
-    /// [`TyCtxt::hir_visit_all_item_likes_in_crate`].
-    query hir_crate(key: ()) -> &'tcx Crate<'tcx> {
-        arena_cache
+    query lower_to_hir(def_id: LocalDefId) -> hir::MaybeOwner<'tcx> {
         eval_always
-        desc { "getting the crate HIR" }
+        desc { "lowering HIR for `{}`", tcx.def_path_str(def_id) }
     }
 
-    query lower_delayed_owner(def_id: LocalDefId) {
-        eval_always
-        desc { "lowering the delayed AST owner `{}`", tcx.def_path_str(def_id) }
-    }
-
-    query delayed_owner(def_id: LocalDefId) -> hir::MaybeOwner<'tcx>  {
+    query hir_owner(def_id: LocalDefId) -> rustc_middle::hir::ProjectedMaybeOwner<'tcx> {
+        desc { "getting owner for `{}`", tcx.def_path_str(def_id) }
         feedable
-        desc { "getting child of lowered delayed AST owner `{}`", tcx.def_path_str(def_id) }
     }
 
     /// All items in the crate.
@@ -232,16 +236,10 @@ rustc_queries! {
     ///
     /// This can be conveniently accessed by `tcx.hir_visit_item_likes_in_module`.
     /// Avoid calling this query directly.
-    query hir_module_items(key: LocalModDefId) -> &'tcx rustc_middle::hir::ModuleItems {
+    query hir_module_items(key: LocalModId) -> &'tcx rustc_middle::hir::ModuleItems {
         arena_cache
         desc { "getting HIR module items in `{}`", tcx.def_path_str(key) }
         cache_on_disk
-    }
-
-    /// Returns HIR ID for the given `LocalDefId`.
-    query local_def_id_to_hir_id(key: LocalDefId) -> hir::HirId {
-        desc { "getting HIR ID of `{}`", tcx.def_path_str(key) }
-        feedable
     }
 
     /// Gives access to the HIR node's parent for the HIR owner `key`.
@@ -252,15 +250,6 @@ rustc_queries! {
         desc { "getting HIR parent of `{}`", tcx.def_path_str(key) }
     }
 
-    /// Gives access to the HIR nodes and bodies inside `key` if it's a HIR owner.
-    ///
-    /// This can be conveniently accessed by `tcx.hir_*` methods.
-    /// Avoid calling this query directly.
-    query opt_hir_owner_nodes(key: LocalDefId) -> Option<&'tcx hir::OwnerNodes<'tcx>> {
-        desc { "getting HIR owner items in `{}`", tcx.def_path_str(key) }
-        feedable
-    }
-
     /// Gives access to the HIR attributes inside the HIR owner `key`.
     ///
     /// This can be conveniently accessed by `tcx.hir_*` methods.
@@ -268,18 +257,6 @@ rustc_queries! {
     query hir_attr_map(key: hir::OwnerId) -> &'tcx hir::AttributeMap<'tcx> {
         desc { "getting HIR owner attributes in `{}`", tcx.def_path_str(key) }
         feedable
-    }
-
-    /// Gives access to lints emitted during ast lowering.
-    ///
-    /// This can be conveniently accessed by `tcx.hir_*` methods.
-    /// Avoid calling this query directly.
-    query opt_ast_lowering_delayed_lints(key: hir::OwnerId) -> Option<&'tcx hir::lints::DelayedLints> {
-        desc { "getting AST lowering delayed lints in `{}`", tcx.def_path_str(key) }
-        // This query has to be `no_hash` and `eval_always`,
-        // because it accesses `delayed_lints` which is not hashed as part of the HIR
-        no_hash
-        eval_always
     }
 
     /// Returns the *default* of the const pararameter given by `DefId`.
@@ -355,12 +332,12 @@ rustc_queries! {
         }
     }
 
-    /// Returns whether the type alias given by `DefId` is lazy.
+    /// Returns whether the type alias given by `DefId` is checked.
     ///
     /// I.e., if the type alias expands / ought to expand to a [free] [alias type]
     /// instead of the underlying aliased type.
     ///
-    /// Relevant for features `lazy_type_alias` and `type_alias_impl_trait`.
+    /// Relevant for features `checked_type_aliases` and `type_alias_impl_trait`.
     ///
     /// # Panics
     ///
@@ -368,9 +345,9 @@ rustc_queries! {
     ///
     /// [free]: rustc_middle::ty::Free
     /// [alias type]: rustc_middle::ty::AliasTy
-    query type_alias_is_lazy(key: DefId) -> bool {
+    query type_alias_is_checked(key: DefId) -> bool {
         desc {
-            "computing whether the type alias `{path}` is lazy",
+            "computing whether the type alias `{path}` is checked",
             path = tcx.def_path_str(key),
         }
         separate_provide_extern
@@ -559,13 +536,16 @@ rustc_queries! {
         desc { "looking up lint levels for `{}`", tcx.def_path_str(key) }
     }
 
-    query lint_expectations(_: ()) -> &'tcx Vec<(LintExpectationId, LintExpectation)> {
+    query lint_expectations(_: ()) -> &'tcx Vec<(StableLintExpectationId, LintExpectation)> {
         arena_cache
         desc { "computing `#[expect]`ed lints in this crate" }
     }
 
-    query lints_that_dont_need_to_run(_: ()) -> &'tcx UnordSet<LintId> {
+    query skippable_lints(_: ()) -> &'tcx UnordSet<LintId> {
         arena_cache
+        // This depends on the lint store, which includes internal lints when the
+        // untracked `-Zunstable-options` flag is set.
+        eval_always
         desc { "Computing all lints that are explicitly enabled or with a default level greater than Allow" }
     }
 
@@ -1138,7 +1118,7 @@ rustc_queries! {
     }
 
     /// Unsafety-check this `LocalDefId`.
-    query check_transmutes(key: LocalDefId) {
+    query check_transmutes(key: LocalDefId) -> Result<(), ErrorGuaranteed> {
         desc { "check transmute calls inside `{}`", tcx.def_path_str(key) }
     }
 
@@ -1176,7 +1156,7 @@ rustc_queries! {
     }
 
     /// Performs lint checking for the module.
-    query lint_mod(key: LocalModDefId) {
+    query lint_mod(key: LocalModId) {
         desc { "linting {}", describe_as_module(key, tcx) }
     }
 
@@ -1185,16 +1165,16 @@ rustc_queries! {
     }
 
     /// Checks the attributes in the module.
-    query check_mod_attrs(key: LocalModDefId) {
+    query check_mod_attrs(key: LocalModId) {
         desc { "checking attributes in {}", describe_as_module(key, tcx) }
     }
 
     /// Checks for uses of unstable APIs in the module.
-    query check_mod_unstable_api_usage(key: LocalModDefId) {
+    query check_mod_unstable_api_usage(key: LocalModId) {
         desc { "checking for unstable API usage in {}", describe_as_module(key, tcx) }
     }
 
-    query check_mod_privacy(key: LocalModDefId) {
+    query check_mod_privacy(key: LocalModId) {
         desc { "checking privacy in {}", describe_as_module(key.to_local_def_id(), tcx) }
     }
 
@@ -1203,18 +1183,13 @@ rustc_queries! {
         desc { "checking liveness of variables in `{}`", tcx.def_path_str(key.to_def_id()) }
     }
 
-    /// Return the live symbols in the crate for dead code check.
-    ///
-    /// The second return value maps from ADTs to ignored derived traits (e.g. Debug and Clone).
-    query live_symbols_and_ignored_derived_traits(_: ()) -> Result<&'tcx (
-        LocalDefIdSet,
-        LocalDefIdMap<FxIndexSet<DefId>>,
-    ), ErrorGuaranteed> {
+    /// Return dead-code liveness summary for the crate.
+    query live_symbols_and_ignored_derived_traits(_: ()) -> Result<&'tcx DeadCodeLivenessSummary, ErrorGuaranteed> {
         arena_cache
         desc { "finding live symbols in crate" }
     }
 
-    query check_mod_deathness(key: LocalModDefId) {
+    query check_mod_deathness(key: LocalModId) {
         desc { "checking deathness of variables in {}", describe_as_module(key, tcx) }
     }
 
@@ -1405,7 +1380,7 @@ rustc_queries! {
         eval_always
         desc { "checking effective visibilities" }
     }
-    query check_private_in_public(module_def_id: LocalModDefId) {
+    query check_private_in_public(module_def_id: LocalModId) {
         desc {
             "checking for private elements in public interfaces for {}",
             describe_as_module(module_def_id, tcx)
@@ -1425,10 +1400,10 @@ rustc_queries! {
     }
 
     /// Generates a MIR body for the shim.
-    query mir_shims(key: ty::InstanceKind<'tcx>) -> &'tcx mir::Body<'tcx> {
+    query mir_shims(key: ty::ShimKind<'tcx>) -> &'tcx mir::Body<'tcx> {
         arena_cache
         desc {
-            "generating MIR shim for `{}`, instance={:?}",
+            "generating MIR shim for `{}`, kind={:?}",
             tcx.def_path_str(key.def_id()),
             key
         }
@@ -1652,7 +1627,7 @@ rustc_queries! {
     /// Like `param_env`, but returns the `ParamEnv` after all opaque types have been
     /// replaced with their hidden type. This is used in the old trait solver
     /// when in `PostAnalysis` mode and should not be called directly.
-    query typing_env_normalized_for_post_analysis(def_id: DefId) -> ty::TypingEnv<'tcx> {
+    query param_env_normalized_for_post_analysis(def_id: DefId) -> ty::ParamEnv<'tcx> {
         desc { "computing revealed normalized predicates of `{}`", tcx.def_path_str(def_id) }
     }
 
@@ -1884,10 +1859,6 @@ rustc_queries! {
     query specializes(_: (DefId, DefId)) -> bool {
         desc { "computing whether impls specialize one another" }
     }
-    query in_scope_traits_map(_: hir::OwnerId)
-        -> Option<&'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>> {
-        desc { "getting traits in scope at a block" }
-    }
 
     /// Returns whether the impl or associated function has the `default` keyword.
     /// Note: This will ICE on inherent impl items. Consider using `AssocItem::defaultness`.
@@ -2094,6 +2065,10 @@ rustc_queries! {
         desc { "inheriting delegation signature" }
     }
 
+    query delegation_user_specified_args(def_id: LocalDefId) -> (&'tcx [GenericArg<'tcx>], &'tcx [GenericArg<'tcx>]) {
+        desc { "getting delegation user-specified args" }
+    }
+
     /// Does lifetime resolution on items. Importantly, we can't resolve
     /// lifetimes directly on things like trait methods, because of trait params.
     /// See `rustc_resolve::late::lifetimes` for details.
@@ -2147,6 +2122,36 @@ rustc_queries! {
         desc { "listing captured lifetimes for opaque `{}`", tcx.def_path_str(def_id) }
     }
 
+    /// For an opaque type or trait associated type, return the list of potentially live
+    /// (identity) generic args from the set of outlives bounds on that alias. Callers should
+    /// instantiate the returned args with the concrete args of the alias.
+    /// ```ignore (illustrative)
+    /// // Edition 2024: all args are captured
+    /// fn foo<'a, 'b, T: 'static>(&'a &'b T) -> impl Sized + 'a {}
+    /// fn bar<'a, 'b, T: 'static>(&'a &'b T) -> impl Sized + 'static {}
+    /// fn baz<'a, 'b, T: 'static>(&'a &'b T) -> impl Sized {}
+    /// ```
+    ///
+    /// In the above:
+    ///   - `foo` outlives `'a`, but we know that `'b: 'a` holds, so `'b` is *also* potentially live
+    ///     (and so is `T`, since `T: 'static` implies `T: 'a`)
+    ///   - `bar` outlives `'static`, so we know that no args are potentially live and we can return an empty set
+    ///   - `baz` has no outlives bound, so return `None` and let the caller decide what to do
+    query live_args_for_alias_from_outlives_bounds(kind: ty::AliasTyKind<'tcx>) -> &'tcx Option<ty::EarlyBinder<'tcx, Vec<ty::GenericArg<'tcx>>>> {
+        arena_cache
+        desc { "identifying live args for alias `{:?}`", kind }
+    }
+
+    /// For each region param of an alias, the identity args that are known to
+    /// outlive it given only the alias's declared where-clauses. Used for liveness:
+    /// these are the only args whose regions the underlying type of the alias
+    /// could capture while satisfying an outlives bound on that param.
+    query args_known_to_outlive_alias_params(def_id: DefId) -> &'tcx ty::EarlyBinder<'tcx, Vec<(ty::Region<'tcx>, Vec<ty::GenericArg<'tcx>>)>> {
+        arena_cache
+        desc { "computing the args known to outlive each region param of alias `{}`", tcx.def_path_str(def_id) }
+        separate_provide_extern
+    }
+
     /// Computes the visibility of the provided `def_id`.
     ///
     /// If the item from the `def_id` doesn't have a visibility, it will panic. For example
@@ -2159,7 +2164,7 @@ rustc_queries! {
     /// ```
     ///
     /// In here, if you call `visibility` on `T`, it'll panic.
-    query visibility(def_id: DefId) -> ty::Visibility<DefId> {
+    query visibility(def_id: DefId) -> ty::Visibility<ModId> {
         desc { "computing visibility of `{}`", tcx.def_path_str(def_id) }
         separate_provide_extern
         feedable
@@ -2174,6 +2179,11 @@ rustc_queries! {
         desc { "computing the uninhabited predicate of `{}`", key }
     }
 
+    /// Do not call this query directly: invoke `Ty::is_opsem_inhabited` instead.
+    query is_opsem_inhabited_raw(env: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>) -> bool {
+        desc { "computing whether `{}` is inhabited on the opsem level", env.value }
+    }
+
     query crate_dep_kind(_: CrateNum) -> CrateDepKind {
         eval_always
         desc { "fetching what a dependency looks like" }
@@ -2186,6 +2196,15 @@ rustc_queries! {
         desc { "fetching what a crate is named" }
         separate_provide_extern
     }
+
+    /// Iterates over all named children of the given module,
+    /// including both proper items and reexports.
+    /// Module here is understood in name resolution sense - it can be a `mod` item,
+    /// or a crate root, or an enum, or a trait.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the provided `id` does not refer to a module.
     query module_children(def_id: DefId) -> &'tcx [ModChild] {
         desc { "collecting child items of module `{}`", tcx.def_path_str(def_id) }
         separate_provide_extern
@@ -2228,7 +2247,8 @@ rustc_queries! {
         desc { "fetch intrinsic name if `{}` is an intrinsic", tcx.def_path_str(def_id) }
         separate_provide_extern
     }
-    /// Returns the lang items defined in another crate by loading it from metadata.
+    /// Returns the lang items defined in all crates by loading them from metadata of dependencies
+    /// and collecting the ones from the current crate.
     query get_lang_items(_: ()) -> &'tcx LanguageItems {
         arena_cache
         eval_always
@@ -2526,7 +2546,7 @@ rustc_queries! {
         &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, Ty<'tcx>>>,
         NoSolution,
     > {
-        desc { "normalizing `{}`", goal.canonical.value.value.value }
+        desc { "normalizing `{}`", goal.canonical.value.value.value.skip_normalization() }
     }
 
     /// Do not call this query directly: part of the `Normalize` type-op
@@ -2536,7 +2556,7 @@ rustc_queries! {
         &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ty::Clause<'tcx>>>,
         NoSolution,
     > {
-        desc { "normalizing `{:?}`", goal.canonical.value.value.value }
+        desc { "normalizing `{:?}`", goal.canonical.value.value.value.skip_normalization() }
     }
 
     /// Do not call this query directly: part of the `Normalize` type-op
@@ -2546,7 +2566,7 @@ rustc_queries! {
         &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ty::PolyFnSig<'tcx>>>,
         NoSolution,
     > {
-        desc { "normalizing `{:?}`", goal.canonical.value.value.value }
+        desc { "normalizing `{:?}`", goal.canonical.value.value.value.skip_normalization() }
     }
 
     /// Do not call this query directly: part of the `Normalize` type-op
@@ -2556,7 +2576,7 @@ rustc_queries! {
         &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, ty::FnSig<'tcx>>>,
         NoSolution,
     > {
-        desc { "normalizing `{:?}`", goal.canonical.value.value.value }
+        desc { "normalizing `{:?}`", goal.canonical.value.value.value.skip_normalization() }
     }
 
     query instantiate_and_check_impossible_predicates(key: (DefId, GenericArgsRef<'tcx>)) -> bool {
@@ -2677,13 +2697,13 @@ rustc_queries! {
         separate_provide_extern
     }
 
-    query doc_link_resolutions(def_id: DefId) -> &'tcx DocLinkResMap {
+    query doc_link_resolutions(def_id: ModId) -> &'tcx DocLinkResMap {
         eval_always
         desc { "resolutions for documentation links for a module" }
         separate_provide_extern
     }
 
-    query doc_link_traits_in_scope(def_id: DefId) -> &'tcx [DefId] {
+    query doc_link_traits_in_scope(def_id: ModId) -> &'tcx [DefId] {
         eval_always
         desc { "traits in scope for documentation links for a module" }
         separate_provide_extern
@@ -2711,12 +2731,6 @@ rustc_queries! {
     /// monomorphized.
     query check_mono_item(key: ty::Instance<'tcx>) {
         desc { "monomorphization-time checking" }
-    }
-
-    /// Builds the set of functions that should be skipped for the move-size check.
-    query skip_move_check_fns(_: ()) -> &'tcx FxIndexSet<DefId> {
-        arena_cache
-        desc { "functions to skip for move-size check" }
     }
 
     query items_of_instance(key: (ty::Instance<'tcx>, CollectionMode)) -> Result<(&'tcx [Spanned<MonoItem<'tcx>>], &'tcx [Spanned<MonoItem<'tcx>>]), NormalizationErrorInMono> {

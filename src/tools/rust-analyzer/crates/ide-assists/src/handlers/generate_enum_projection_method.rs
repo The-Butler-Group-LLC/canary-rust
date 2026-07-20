@@ -40,7 +40,7 @@ use crate::{
 // ```
 pub(crate) fn generate_enum_try_into_method(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     generate_enum_projection_method(
         acc,
@@ -85,7 +85,10 @@ pub(crate) fn generate_enum_try_into_method(
 //     }
 // }
 // ```
-pub(crate) fn generate_enum_as_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn generate_enum_as_method(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     generate_enum_projection_method(
         acc,
         ctx,
@@ -113,7 +116,7 @@ struct ProjectionProps {
 
 fn generate_enum_projection_method(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     assist_id: &'static str,
     assist_description: &str,
     props: ProjectionProps,
@@ -216,7 +219,7 @@ impl Method {
     fn new(variant: &ast::Variant, fn_name_prefix: &str) -> Option<Self> {
         use itertools::Itertools as _;
         let variant_name = variant.name()?;
-        let fn_name = format!("{fn_name_prefix}_{}", &to_lower_snake_case(&variant_name.text()));
+        let fn_name = format!("{fn_name_prefix}_{}", to_lower_snake_case(&variant_name.text()));
 
         match variant.kind() {
             ast::StructKind::Record(record) => {

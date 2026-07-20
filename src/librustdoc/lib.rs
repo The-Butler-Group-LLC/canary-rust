@@ -5,7 +5,7 @@
 )]
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
-#![feature(box_patterns)]
+#![feature(deref_patterns)]
 #![feature(file_buffered)]
 #![feature(formatting_options)]
 #![feature(iter_intersperse)]
@@ -13,8 +13,10 @@
 #![feature(rustc_private)]
 #![feature(test)]
 #![feature(trim_prefix_suffix)]
+#![feature(variant_count)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
+#![warn(rustc::symbol_intern_string_literal)]
 // tidy-alphabetical-end
 
 // N.B. these need `extern crate` even in 2018 edition
@@ -457,6 +459,14 @@ fn opts() -> Vec<RustcOptGroup> {
                 By default, it is at `forbid` level.",
             "LEVEL",
         ),
+        opt(
+            Stable,
+            Multi,
+            "",
+            "remap-path-prefix",
+            "Remap source names in compiler messages",
+            "FROM=TO",
+        ),
         opt(Unstable, Opt, "", "index-page", "Markdown file to be used as index page", "PATH"),
         opt(
             Unstable,
@@ -533,7 +543,7 @@ fn opts() -> Vec<RustcOptGroup> {
             "",
         ),
         opt(
-            Unstable,
+            Stable,
             Multi,
             "",
             "emit",
@@ -548,14 +558,6 @@ fn opts() -> Vec<RustcOptGroup> {
             "merge-doctests",
             "Force all doctests to be compiled as a single binary, instead of one binary per test. If merging fails, rustdoc will emit a hard error.",
             "yes|no|auto",
-        ),
-        opt(
-            Unstable,
-            Multi,
-            "",
-            "remap-path-prefix",
-            "Remap source names in compiler messages",
-            "FROM=TO",
         ),
         opt(
             Unstable,
@@ -611,28 +613,41 @@ fn opts() -> Vec<RustcOptGroup> {
             Unstable,
             Opt,
             "",
-            "merge",
-            "Controls how rustdoc handles files from previously documented crates in the doc root\n\
-                none = Do not write cross-crate information to the --out-dir\n\
-                shared = Append current crate's info to files found in the --out-dir\n\
-                finalize = Write current crate's info and --include-parts-dir info to the --out-dir, overwriting conflicting files",
-            "none|shared|finalize",
+            "write-doc-meta-dir",
+            "Writes trait implementations and other info for the current crate to provided path",
+            "path/to/doc.meta",
+        ),
+        opt(
+            Unstable,
+            Multi,
+            "",
+            "read-doc-meta-dir",
+            "Includes trait implementations and other crate info from provided path",
+            "path/to/doc.meta",
         ),
         opt(
             Unstable,
             Opt,
             "",
             "parts-out-dir",
-            "Writes trait implementations and other info for the current crate to provided path. Only use with --merge=none",
-            "path/to/doc.parts/<crate-name>",
+            "Deprecated synonym of write-doc-meta-dir",
+            "path/to/doc.meta",
         ),
         opt(
             Unstable,
             Multi,
             "",
             "include-parts-dir",
-            "Includes trait implementations and other crate info from provided path. Only use with --merge=finalize",
-            "path/to/doc.parts/<crate-name>",
+            "Deprecated synonym of read-doc-meta-dir",
+            "path/to/doc.meta",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "merge",
+            "Deprecated option to specify read/write-doc-meta-dir mode",
+            "none, shared, finalize",
         ),
         opt(Unstable, Flag, "", "html-no-source", "Disable HTML source code pages generation", ""),
         opt(
@@ -756,7 +771,7 @@ fn run_renderer<
 
 /// Renders and writes cross-crate info files, like the search index. This function exists so that
 /// we can run rustdoc without a crate root in the `--merge=finalize` mode. Cross-crate info files
-/// discovered via `--include-parts-dir` are combined and written to the doc root.
+/// discovered via `--read-doc-meta-dir` are combined and written to the doc root.
 fn run_merge_finalize(opt: config::RenderOptions) -> Result<(), error::Error> {
     assert!(
         opt.should_merge.write_rendered_cci,
@@ -869,9 +884,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                     };
                     rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
                         let has_dep_info = render_options.dep_info().is_some();
-                        if render_options.emit.contains(&EmitType::HtmlNonStaticFiles)
-                            || render_options.emit.is_empty()
-                        {
+                        if render_options.emit.contains(&EmitType::HtmlNonStaticFiles) {
                             markdown::render_and_write(file, render_options, edition)?;
                         }
                         if has_dep_info {
@@ -984,11 +997,13 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                         },
                     )
                 }),
-                config::OutputFormat::Json => sess.time("render_json", || {
+                config::OutputFormat::IrJson => sess.time("render_json", || {
                     run_renderer(krate, render_opts, cache, tcx, json::JsonRenderer::init)
                 }),
-                // Already handled above with doctest runners.
-                config::OutputFormat::Doctest => unreachable!(),
+                // Already handled above with doctest runners or coverage early return
+                config::OutputFormat::Doctest | config::OutputFormat::CoverageJson => {
+                    unreachable!()
+                }
             }
         })
     })

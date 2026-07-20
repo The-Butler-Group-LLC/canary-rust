@@ -133,6 +133,12 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
         submodules: &[],
     },
     WorkspaceInfo {
+        path: "library/stdarch",
+        exceptions: EXCEPTIONS_STDARCH,
+        crates_and_deps: None,
+        submodules: &[],
+    },
+    WorkspaceInfo {
         path: "compiler/rustc_codegen_cranelift",
         exceptions: EXCEPTIONS_CRANELIFT,
         crates_and_deps: Some((
@@ -236,8 +242,18 @@ const EXCEPTIONS_RUST_ANALYZER: ExceptionList = &[
 
 const EXCEPTIONS_RUSTC_PERF: ExceptionList = &[
     // tidy-alphabetical-start
+    ("aws-lc-rs", "ISC AND (Apache-2.0 OR ISC)"),
+    (
+        "aws-lc-sys",
+        "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
+    ),
+    ("brotli", "BSD-3-Clause AND MIT"),
+    ("fast-srgb8", "MIT OR Apache-2.0 OR CC0-1.0"),
     ("inferno", "CDDL-1.0"),
     ("option-ext", "MPL-2.0"),
+    ("wasite", "Apache-2.0 OR BSL-1.0 OR MIT"),
+    ("webpki-root-certs", "CDLA-Permissive-2.0"),
+    ("whoami", "Apache-2.0 OR BSL-1.0 OR MIT"),
     // tidy-alphabetical-end
 ];
 
@@ -253,6 +269,8 @@ const EXCEPTIONS_RUSTBOOK: ExceptionList = &[
     ("mdbook-summary", "MPL-2.0"),
     // tidy-alphabetical-end
 ];
+
+const EXCEPTIONS_STDARCH: ExceptionList = &[];
 
 const EXCEPTIONS_CRANELIFT: ExceptionList = &[];
 
@@ -351,6 +369,8 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "itoa",
     "jiff",
     "jiff-static",
+    "jiff-tzdb",
+    "jiff-tzdb-platform",
     "jobserver",
     "lazy_static",
     "leb128",
@@ -466,6 +486,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "unicode-script",
     "unicode-security",
     "unicode-width",
+    "utf8_iter",
     "utf8parse",
     "valuable",
     "version_check",
@@ -543,16 +564,7 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "wasip2",
     "wasip3",
     "windows-link",
-    "windows-sys",
-    "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
+    "windows-sys@0.61.100", // Enforce the usage of our dummy windows-sys patch. Keep version in sync.
     "wit-bindgen",
     // tidy-alphabetical-end
 ];
@@ -597,6 +609,7 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "log",
     "mach2",
     "memchr",
+    "memmap2",
     "object",
     "proc-macro2",
     "quote",
@@ -691,6 +704,9 @@ pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
 
 /// Ensure the list of proc-macro crate transitive dependencies is up to date
 fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, check: &mut RunningCheck) {
+    if std::env::var("RUSTC").is_err() {
+        panic!("tidy must be run under bootstrap (./x test tidy), not as a standalone command");
+    }
     let mut cmd = cargo_metadata::MetadataCommand::new();
     cmd.cargo_path(cargo)
         .manifest_path(root.join("Cargo.toml"))

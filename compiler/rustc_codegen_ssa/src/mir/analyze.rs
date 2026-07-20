@@ -7,8 +7,8 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{self, DefLocation, Location, TerminatorKind, traversal};
-use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::{bug, span_bug};
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
+use rustc_middle::{bug, span_bug, ty};
 use tracing::debug;
 
 use super::FunctionCx;
@@ -55,7 +55,7 @@ pub(crate) fn non_ssa_locals<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     non_ssa_locals
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum LocalKind {
     ZST,
     /// A local that requires an alloca.
@@ -83,12 +83,11 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> LocalAnalyzer<'a, 'b, 'tcx, Bx>
             LocalKind::Unused => {
                 let ty = fx.monomorphize(decl.ty);
                 let layout = fx.cx.spanned_layout_of(ty, decl.source_info.span);
-                *kind =
-                    if fx.cx.is_backend_immediate(layout) || fx.cx.is_backend_scalar_pair(layout) {
-                        LocalKind::SSA(location)
-                    } else {
-                        LocalKind::Memory
-                    };
+                *kind = if let abi::BackendRepr::Memory { .. } = layout.backend_repr {
+                    LocalKind::Memory
+                } else {
+                    LocalKind::SSA(location)
+                };
             }
             LocalKind::SSA(_) => *kind = LocalKind::Memory,
         }
@@ -157,7 +156,7 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> LocalAnalyzer<'a, 'b, 'tcx, Bx>
                 }
             }
             debug_assert!(
-                !self.fx.cx.is_backend_ref(layout),
+                layout.is_ssa_standalone(),
                 "Post-projection {place_ref:?} layout should be non-Ref, but it's {layout:?}",
             );
         }
@@ -195,12 +194,20 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> Visitor<'tcx> for LocalAnalyzer
         match context {
             PlaceContext::MutatingUse(MutatingUseContext::Call) => {
                 let call = location.block;
-                let TerminatorKind::Call { target, .. } =
-                    self.fx.mir.basic_blocks[call].terminator().kind
+                let TerminatorKind::Call { target, func, .. } =
+                    &self.fx.mir.basic_blocks[call].terminator().kind
                 else {
                     bug!()
                 };
-                self.define(local, DefLocation::CallReturn { call, target });
+                let tcx = self.fx.cx.tcx();
+                let func_ty = func.ty(&self.fx.mir.local_decls, tcx);
+                if let ty::FnDef(def_id, _args) = *func_ty.kind()
+                    && let Some(intrinsic) = tcx.intrinsic(def_id)
+                    && self.fx.cx.intrinsic_call_expects_place_always(intrinsic.name)
+                {
+                    self.locals[local] = LocalKind::Memory;
+                }
+                self.define(local, DefLocation::CallReturn { call, target: *target });
             }
 
             PlaceContext::NonUse(_)

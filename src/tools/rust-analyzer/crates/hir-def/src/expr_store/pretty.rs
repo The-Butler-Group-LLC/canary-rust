@@ -8,17 +8,18 @@ use std::{
 
 use hir_expand::{Lookup, mod_path::PathKind};
 use itertools::Itertools;
+use rustc_abi::ExternAbi;
 use span::Edition;
 use stdx::never;
 use syntax::ast::{HasName, RangeOp};
 
 use crate::{
-    AdtId, DefWithBodyId, FunctionId, GenericDefId, StructId, TypeParamId, VariantId,
+    AdtId, DefWithBodyId, FunctionId, GenericDefId, MacroId, StructId, TypeParamId, VariantId,
     attrs::AttrFlags,
     expr_store::path::{GenericArg, GenericArgs},
     hir::{
-        Array, BindingAnnotation, CaptureBy, ClosureKind, Literal, Movability, RecordSpread,
-        Statement,
+        Array, BindingAnnotation, CaptureBy, ClosureKind, CoroutineKind, Literal, Movability,
+        RecordSpread, Statement,
         generics::{GenericParams, WherePredicate},
     },
     lang_item::LangItemTarget,
@@ -53,9 +54,9 @@ pub enum LineFormat {
     Indentation,
 }
 
-fn item_name<Id, Loc>(db: &dyn DefDatabase, id: Id, default: &str) -> String
+fn item_name<Id, Loc>(db: &dyn SourceDatabase, id: Id, default: &str) -> String
 where
-    Id: Lookup<Database = dyn DefDatabase, Data = Loc>,
+    Id: Lookup<Data = Loc>,
     Loc: HasSource,
     Loc::Value: ast::HasName,
 {
@@ -65,7 +66,7 @@ where
 }
 
 pub fn print_body_hir(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     body: &Body,
     owner: DefWithBodyId,
     edition: Edition,
@@ -92,11 +93,11 @@ pub fn print_body_hir(
     if let DefWithBodyId::FunctionId(_) = owner {
         p.buf.push('(');
         if let Some(self_param) = body.self_param {
-            p.print_binding(self_param);
+            p.print_binding(self_param.formal);
             p.buf.push_str(", ");
         }
         body.params.iter().for_each(|param| {
-            p.print_pat(*param);
+            p.print_pat(param.formal);
             p.buf.push_str(", ");
         });
         // remove the last ", " in param list
@@ -113,7 +114,11 @@ pub fn print_body_hir(
     p.buf
 }
 
-pub fn print_variant_body_hir(db: &dyn DefDatabase, owner: VariantId, edition: Edition) -> String {
+pub fn print_variant_body_hir(
+    db: &dyn SourceDatabase,
+    owner: VariantId,
+    edition: Edition,
+) -> String {
     let header = match owner {
         VariantId::StructId(it) => format!("struct {}", item_name(db, it, "<missing>")),
         VariantId::EnumVariantId(it) => format!(
@@ -165,7 +170,7 @@ pub fn print_variant_body_hir(db: &dyn DefDatabase, owner: VariantId, edition: E
     p.buf
 }
 
-pub fn print_signature(db: &dyn DefDatabase, owner: GenericDefId, edition: Edition) -> String {
+pub fn print_signature(db: &dyn SourceDatabase, owner: GenericDefId, edition: Edition) -> String {
     match owner {
         GenericDefId::AdtId(id) => match id {
             AdtId::StructId(id) => {
@@ -192,7 +197,7 @@ pub fn print_signature(db: &dyn DefDatabase, owner: GenericDefId, edition: Editi
 }
 
 pub fn print_path(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     store: &ExpressionStore,
     path: &Path,
     edition: Edition,
@@ -210,7 +215,7 @@ pub fn print_path(
 }
 
 pub fn print_struct(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     id: StructId,
     StructSignature { name, generic_params, store, flags, shape }: &StructSignature,
     edition: Edition,
@@ -258,7 +263,7 @@ pub fn print_struct(
 }
 
 pub fn print_function(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     id: FunctionId,
     signature @ FunctionSignature {
         name,
@@ -292,7 +297,7 @@ pub fn print_function(
     if flags.contains(FnFlags::EXPLICIT_SAFE) {
         w!(p, "safe ");
     }
-    if let Some(abi) = abi {
+    if *abi != ExternAbi::Rust {
         w!(p, "extern \"{}\" ", abi.as_str());
     }
     w!(p, "fn ");
@@ -320,7 +325,11 @@ pub fn print_function(
     p.buf
 }
 
-fn print_where_clauses(db: &dyn DefDatabase, generic_params: &GenericParams, p: &mut Printer<'_>) {
+fn print_where_clauses(
+    db: &dyn SourceDatabase,
+    generic_params: &GenericParams,
+    p: &mut Printer<'_>,
+) {
     if !generic_params.where_predicates.is_empty() {
         w!(p, "\nwhere\n");
         p.indented(|p| {
@@ -359,7 +368,11 @@ fn print_where_clauses(db: &dyn DefDatabase, generic_params: &GenericParams, p: 
     }
 }
 
-fn print_generic_params(db: &dyn DefDatabase, generic_params: &GenericParams, p: &mut Printer<'_>) {
+fn print_generic_params(
+    db: &dyn SourceDatabase,
+    generic_params: &GenericParams,
+    p: &mut Printer<'_>,
+) {
     if !generic_params.is_empty() {
         w!(p, "<");
         let mut first = true;
@@ -399,7 +412,7 @@ fn print_generic_params(db: &dyn DefDatabase, generic_params: &GenericParams, p:
 }
 
 pub fn print_expr_hir(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     store: &ExpressionStore,
     _owner: ExpressionStoreOwnerId,
     expr: ExprId,
@@ -418,7 +431,7 @@ pub fn print_expr_hir(
 }
 
 pub fn print_pat_hir(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     store: &ExpressionStore,
     _owner: ExpressionStoreOwnerId,
     pat: PatId,
@@ -438,7 +451,7 @@ pub fn print_pat_hir(
 }
 
 struct Printer<'a> {
-    db: &'a dyn DefDatabase,
+    db: &'a dyn SourceDatabase,
     store: &'a ExpressionStore,
     buf: String,
     indent_level: usize,
@@ -536,6 +549,7 @@ impl Printer<'_> {
             Expr::Missing => w!(self, "�"),
             Expr::Underscore => w!(self, "_"),
             Expr::InlineAsm(_) => w!(self, "builtin#asm(_)"),
+            Expr::IncludeBytes => w!(self, "include_bytes!(_)"),
             Expr::OffsetOf(offset_of) => {
                 w!(self, "builtin#offset_of(");
                 self.print_type_ref(offset_of.container);
@@ -566,7 +580,7 @@ impl Printer<'_> {
                 w!(self, " = ");
                 self.print_expr_in(prec, *expr);
             }
-            Expr::Loop { body, label } => {
+            Expr::Loop { body, label, source: _ } => {
                 if let Some(lbl) = label {
                     w!(self, "{}: ", self.store[*lbl].name.display(self.db, self.edition));
                 }
@@ -668,10 +682,7 @@ impl Printer<'_> {
                 }
             }
             Expr::RecordLit { path, fields, spread } => {
-                match path {
-                    Some(path) => self.print_path(path),
-                    None => w!(self, "�"),
-                }
+                self.print_path(path);
 
                 w!(self, "{{");
                 let edition = self.edition;
@@ -764,28 +775,36 @@ impl Printer<'_> {
                 let mut body = *body;
                 let mut print_pipes = true;
                 match closure_kind {
-                    ClosureKind::Coroutine(Movability::Static) => {
+                    ClosureKind::OldCoroutine(Movability::Static) => {
                         w!(self, "static ");
                     }
-                    ClosureKind::AsyncClosure => {
+                    ClosureKind::CoroutineClosure(kind) => {
                         if let Expr::Closure {
                             body: inner_body,
-                            closure_kind: ClosureKind::AsyncBlock { .. },
+                            closure_kind: ClosureKind::Coroutine { .. },
                             ..
                         } = self.store[body]
                         {
                             body = inner_body;
                         } else {
-                            never!("async closure should always have an async block body");
+                            never!("coroutine closure should always have a coroutine body");
                         }
 
-                        w!(self, "async ");
+                        match kind {
+                            CoroutineKind::Async => w!(self, "async "),
+                            CoroutineKind::Gen => w!(self, "gen "),
+                            CoroutineKind::AsyncGen => w!(self, "async gen "),
+                        }
                     }
-                    ClosureKind::AsyncBlock { .. } => {
-                        w!(self, "async ");
+                    ClosureKind::Coroutine { kind, .. } => {
+                        match kind {
+                            CoroutineKind::Async => w!(self, "async "),
+                            CoroutineKind::Gen => w!(self, "gen "),
+                            CoroutineKind::AsyncGen => w!(self, "async gen "),
+                        }
                         print_pipes = false;
                     }
-                    ClosureKind::Closure | ClosureKind::Coroutine(Movability::Movable) => (),
+                    ClosureKind::Closure | ClosureKind::OldCoroutine(Movability::Movable) => (),
                 }
                 match capture_by {
                     CaptureBy::Value => {
@@ -898,7 +917,9 @@ impl Printer<'_> {
 
         match pat {
             Pat::Missing => w!(self, "�"),
+            Pat::Rest => w!(self, ".."),
             Pat::Wild => w!(self, "_"),
+            Pat::NotNull => w!(self, "!null"),
             Pat::Tuple { args, ellipsis } => {
                 w!(self, "(");
                 for (i, pat) in args.iter().enumerate() {
@@ -923,10 +944,7 @@ impl Printer<'_> {
                 w!(self, ")");
             }
             Pat::Record { path, args, ellipsis } => {
-                match path {
-                    Some(path) => self.print_path(path),
-                    None => w!(self, "�"),
-                }
+                self.print_path(path);
 
                 w!(self, " {{");
                 let edition = self.edition;
@@ -1004,10 +1022,7 @@ impl Printer<'_> {
                 }
             }
             Pat::TupleStruct { path, args, ellipsis } => {
-                match path {
-                    Some(path) => self.print_path(path),
-                    None => w!(self, "�"),
-                }
+                self.print_path(path);
                 w!(self, "(");
                 for (i, arg) in args.iter().enumerate() {
                     if i != 0 {
@@ -1030,6 +1045,11 @@ impl Printer<'_> {
             Pat::Box { inner } => {
                 w!(self, "box ");
                 self.print_pat(*inner);
+            }
+            Pat::Deref { inner } => {
+                w!(self, "deref!(");
+                self.print_pat(*inner);
+                w!(self, ")");
             }
             Pat::ConstBlock(c) => {
                 w!(self, "const ");
@@ -1128,6 +1148,10 @@ impl Printer<'_> {
                 LangItemTarget::TypeAliasId(it) => write_name!(it),
                 LangItemTarget::TraitId(it) => write_name!(it),
                 LangItemTarget::EnumVariantId(it) => write_name!(it),
+                LangItemTarget::ConstId(it) => write_name!(it),
+                LangItemTarget::MacroId(MacroId::Macro2Id(it)) => write_name!(it),
+                LangItemTarget::MacroId(MacroId::MacroRulesId(it)) => write_name!(it),
+                LangItemTarget::MacroId(MacroId::ProcMacroId(it)) => write_name!(it),
             }
 
             if let Some(s) = s {
@@ -1310,9 +1334,9 @@ impl Printer<'_> {
                 if fn_.is_unsafe {
                     w!(self, "unsafe ");
                 }
-                if let Some(abi) = &fn_.abi {
+                if fn_.abi != ExternAbi::Rust {
                     w!(self, "extern ");
-                    w!(self, "{}", abi.as_str());
+                    w!(self, "{}", fn_.abi.as_str());
                     w!(self, " ");
                 }
                 w!(self, "fn(");
@@ -1339,6 +1363,11 @@ impl Printer<'_> {
             TypeRef::DynTrait(bounds) => {
                 w!(self, "dyn ");
                 self.print_type_bounds(bounds);
+            }
+            TypeRef::PatternType(ty, pat) => {
+                self.print_type_ref(*ty);
+                w!(self, " is ");
+                self.print_pat(*pat);
             }
         }
     }

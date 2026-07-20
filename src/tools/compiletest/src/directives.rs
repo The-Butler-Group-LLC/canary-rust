@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::process::Command;
 use std::{env, fs};
@@ -6,8 +7,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
 use tracing::*;
 
-use crate::common::{CodegenBackend, Config, Debugger, FailMode, PassMode, RunFailMode, TestMode};
-use crate::debuggers::{extract_cdb_version, extract_gdb_version};
+use crate::common::{Config, Debugger, PassFailMode, TestMode};
+use crate::debuggers::{LldbVersion, extract_cdb_version, extract_gdb_version};
 use crate::directives::auxiliary::parse_and_update_aux;
 pub(crate) use crate::directives::auxiliary::{AuxCrate, AuxProps};
 use crate::directives::directive_names::{
@@ -16,7 +17,7 @@ use crate::directives::directive_names::{
 pub(crate) use crate::directives::file::FileDirectives;
 use crate::directives::handlers::DIRECTIVE_HANDLERS_MAP;
 use crate::directives::line::DirectiveLine;
-use crate::directives::needs::CachedNeedsConditions;
+use crate::directives::needs::PreparedNeedsConditions;
 use crate::edition::{Edition, parse_edition};
 use crate::errors::ErrorKind;
 use crate::executor::{CollectedTestDesc, ShouldFail};
@@ -40,14 +41,14 @@ pub(crate) struct DirectivesCache {
     /// "Conditions" used by `ignore-*` and `only-*` directives, prepared in
     /// advance so that they don't have to be evaluated repeatedly.
     cfg_conditions: cfg::PreparedConditions,
-    needs: CachedNeedsConditions,
+    needs: PreparedNeedsConditions,
 }
 
 impl DirectivesCache {
     pub(crate) fn load(config: &Config) -> Self {
         Self {
             cfg_conditions: cfg::prepare_conditions(config),
-            needs: CachedNeedsConditions::load(config),
+            needs: needs::prepare_needs_conditions(config),
         }
     }
 }
@@ -165,12 +166,13 @@ pub(crate) struct TestProps {
     // error annotations are needed, but this may be updated in the future to
     // include other relaxations.
     pub(crate) known_bug: bool,
-    // How far should the test proceed while still passing.
-    pass_mode: Option<PassMode>,
+    /// Whether this is a check, build, or build-and-run test, and whether the
+    /// final step should succeed or fail.
+    ///
+    /// None for non-UI tests, and for auxiliary crates used by UI tests.
+    pub(crate) pass_fail_mode: Option<PassFailMode>,
     // Ignore `--pass` overrides from the command line for this test.
-    ignore_pass: bool,
-    // How far this test should proceed to start failing.
-    pub(crate) fail_mode: Option<FailMode>,
+    pub(crate) no_pass_override: bool,
     // rustdoc will test the output of the `--test` option
     pub(crate) check_test_line_numbers_match: bool,
     // customized normalization rules
@@ -243,7 +245,6 @@ mod directives {
     pub(crate) const UNSET_RUSTC_ENV: &str = "unset-rustc-env";
     pub(crate) const FORBID_OUTPUT: &str = "forbid-output";
     pub(crate) const CHECK_TEST_LINE_NUMBERS_MATCH: &str = "check-test-line-numbers-match";
-    pub(crate) const IGNORE_PASS: &str = "ignore-pass";
     pub(crate) const FAILURE_STATUS: &str = "failure-status";
     pub(crate) const DONT_CHECK_FAILURE_STATUS: &str = "dont-check-failure-status";
     pub(crate) const RUN_RUSTFIX: &str = "run-rustfix";
@@ -296,9 +297,8 @@ impl TestProps {
             incremental_dir: None,
             incremental: false,
             known_bug: false,
-            pass_mode: None,
-            fail_mode: None,
-            ignore_pass: false,
+            pass_fail_mode: None,
+            no_pass_override: false,
             check_test_line_numbers_match: false,
             normalize_stdout: vec![],
             normalize_stderr: vec![],
@@ -332,7 +332,7 @@ impl TestProps {
 
         // copy over select properties to the aux build:
         props.incremental_dir = self.incremental_dir.clone();
-        props.ignore_pass = true;
+        props.no_pass_override = true;
         props.load_from(testfile, revision, config);
 
         props
@@ -343,10 +343,9 @@ impl TestProps {
         props.load_from(testfile, revision, config);
         props.exec_env.push(("RUSTC".to_string(), config.rustc_path.to_string()));
 
-        match (props.pass_mode, props.fail_mode) {
-            (None, None) if config.mode == TestMode::Ui => props.fail_mode = Some(FailMode::Check),
-            (Some(_), Some(_)) => panic!("cannot use a *-fail and *-pass mode together"),
-            _ => {}
+        // UI tests default to `//@ check-fail` if unspecified.
+        if config.mode == TestMode::Ui && props.pass_fail_mode.is_none() {
+            props.pass_fail_mode = Some(PassFailMode::CheckFail);
         }
 
         props
@@ -406,87 +405,34 @@ impl TestProps {
         }
     }
 
-    fn update_fail_mode(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
-        let check_ui = |mode: &str| {
-            if config.mode != TestMode::Ui {
-                panic!("`{}-fail` directive is only supported in UI tests", mode);
-            }
-        };
-        let fail_mode = if config.parse_name_directive(ln, "check-fail") {
-            check_ui("check");
-            Some(FailMode::Check)
-        } else if config.parse_name_directive(ln, "build-fail") {
-            check_ui("build");
-            Some(FailMode::Build)
-        } else if config.parse_name_directive(ln, "run-fail") {
-            check_ui("run");
-            Some(FailMode::Run(RunFailMode::Fail))
-        } else if config.parse_name_directive(ln, "run-crash") {
-            check_ui("run");
-            Some(FailMode::Run(RunFailMode::Crash))
-        } else if config.parse_name_directive(ln, "run-fail-or-crash") {
-            check_ui("run");
-            Some(FailMode::Run(RunFailMode::FailOrCrash))
-        } else {
-            None
-        };
-        match (self.fail_mode, fail_mode) {
-            (None, Some(_)) => self.fail_mode = fail_mode,
-            (Some(_), Some(_)) => panic!("multiple `*-fail` directives in a single test"),
-            (_, None) => {}
+    fn update_pass_fail_mode(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
+        let name = ln.name;
+        if config.mode != TestMode::Ui {
+            panic!("`{name}` directive is only supported in UI tests");
         }
-    }
-
-    fn update_pass_mode(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
-        let check_no_run = |s| match (config.mode, s) {
-            (TestMode::Ui, _) => (),
-            (mode, _) => panic!("`{s}` directive is not supported in `{mode}` tests"),
-        };
-        let pass_mode = if config.parse_name_directive(ln, "check-pass") {
-            check_no_run("check-pass");
-            Some(PassMode::Check)
-        } else if config.parse_name_directive(ln, "build-pass") {
-            check_no_run("build-pass");
-            Some(PassMode::Build)
-        } else if config.parse_name_directive(ln, "run-pass") {
-            check_no_run("run-pass");
-            Some(PassMode::Run)
-        } else {
-            None
-        };
-        match (self.pass_mode, pass_mode) {
-            (None, Some(_)) => self.pass_mode = pass_mode,
-            (Some(_), Some(_)) => panic!("multiple `*-pass` directives in a single test"),
-            (_, None) => {}
+        if self.pass_fail_mode.is_some() {
+            panic!("multiple `*-fail` or `*-pass` directives in a single test");
         }
-    }
 
-    pub(crate) fn pass_mode(&self, config: &Config) -> Option<PassMode> {
-        if !self.ignore_pass && self.fail_mode.is_none() {
-            if let mode @ Some(_) = config.force_pass_mode {
-                return mode;
-            }
-        }
-        self.pass_mode
-    }
-
-    // does not consider CLI override for pass mode
-    pub(crate) fn local_pass_mode(&self) -> Option<PassMode> {
-        self.pass_mode
+        let mode = ln.name.parse::<PassFailMode>().unwrap();
+        self.pass_fail_mode = Some(mode);
     }
 
     fn update_add_minicore(&mut self, ln: &DirectiveLine<'_>, config: &Config) {
         let add_minicore = config.parse_name_directive(ln, directives::ADD_MINICORE);
         if add_minicore {
-            if !matches!(config.mode, TestMode::Ui | TestMode::Codegen | TestMode::Assembly) {
+            if !matches!(
+                config.mode,
+                TestMode::Ui | TestMode::Codegen | TestMode::Assembly | TestMode::MirOpt
+            ) {
                 panic!(
-                    "`add-minicore` is currently only supported for ui, codegen and assembly test modes"
+                    "`add-minicore` is currently only supported for ui, codegen, assembly and mir-opt test modes"
                 );
             }
 
             // FIXME(jieyouxu): this check is currently order-dependent, but we should probably
             // collect all directives in one go then perform a validation pass after that.
-            if self.local_pass_mode().is_some_and(|pm| pm == PassMode::Run) {
+            if self.pass_fail_mode == Some(PassFailMode::RunPass) {
                 // `minicore` can only be used with non-run modes, because it's `core` prelude stubs
                 // and can't run.
                 panic!("`add-minicore` cannot be used to run the test binary");
@@ -672,7 +618,11 @@ impl Config {
     }
 
     fn parse_pp_exact(&self, line: &DirectiveLine<'_>) -> Option<Utf8PathBuf> {
-        if let Some(s) = self.parse_name_value_directive(line, "pp-exact") {
+        // Unusually, `//@ pp-exact` can be used with or without a colon, so to avoid a panic
+        // in the parse method we need to make sure there is a colon before calling it.
+        if line.value_after_colon().is_some()
+            && let Some(s) = self.parse_name_value_directive(line, "pp-exact")
+        {
             Some(Utf8PathBuf::from(&s))
         } else if self.parse_name_directive(line, "pp-exact") {
             line.file_path.file_name().map(Utf8PathBuf::from)
@@ -702,10 +652,17 @@ impl Config {
     }
 
     fn parse_name_directive(&self, line: &DirectiveLine<'_>, directive: &str) -> bool {
-        // FIXME(Zalathar): Ideally, this should raise an error if a name-only
-        // directive is followed by a colon, since that's the wrong syntax.
-        // But we would need to fix tests that rely on the current behaviour.
-        line.name == directive
+        if line.name != directive {
+            return false;
+        }
+
+        if line.value_after_colon().is_some() {
+            let &DirectiveLine { file_path, line_number, .. } = line;
+            panic!(
+                "{file_path}:{line_number}: directive `{directive}` must not be followed by a colon"
+            );
+        }
+        true
     }
 
     fn parse_name_value_directive(
@@ -719,10 +676,9 @@ impl Config {
             return None;
         };
 
-        // FIXME(Zalathar): This silently discards directives with a matching
-        // name but no colon. Unfortunately, some directives (e.g. "pp-exact")
-        // currently rely on _not_ panicking here.
-        let value = line.value_after_colon()?;
+        let value = line.value_after_colon().unwrap_or_else(|| {
+            panic!("{file_path}:{line_number}: directive `{directive}` must be followed by a colon and value");
+        });
         debug!("{}: {}", directive, value);
         let value = expand_variables(value.to_owned(), self);
 
@@ -940,57 +896,85 @@ pub(crate) fn make_test_description(
     poisoned: &mut bool,
     aux_props: &mut AuxProps,
 ) -> CollectedTestDesc {
-    let mut ignore = false;
-    let mut ignore_message = None;
+    let mut ignore_message: Option<Cow<'static, str>> = None;
     let mut should_fail = false;
 
-    // Scan through the test file to handle `ignore-*`, `only-*`, and `needs-*` directives.
-    iter_directives(config, file_directives, &mut |ln @ &DirectiveLine { line_number, .. }| {
-        if !ln.applies_to_test_revision(test_revision) {
-            return;
-        }
-
-        // Parse `aux-*` directives, for use by up-to-date checks.
-        parse_and_update_aux(config, ln, aux_props);
-
-        macro_rules! decision {
-            ($e:expr) => {
-                match $e {
-                    IgnoreDecision::Ignore { reason } => {
-                        ignore = true;
-                        ignore_message = Some(reason.into());
-                    }
-                    IgnoreDecision::Error { message } => {
-                        error!("{path}:{line_number}: {message}");
-                        *poisoned = true;
-                        return;
-                    }
-                    IgnoreDecision::Continue => {}
+    // Perform a per-file (rather than per-line) ignore decision to skip running debuginfo tests
+    // if we don't have a debugger for them available.
+    // This is needed because we duplicate the Config once for each debugger.
+    if config.mode == TestMode::DebugInfo {
+        match &config.debugger {
+            Some(Debugger::Cdb) => {
+                if let Some(msg) = check_cdb_support(config) {
+                    ignore_message = Some(Cow::Owned(msg));
                 }
-            };
+            }
+            Some(Debugger::Gdb) => {
+                if let Some(msg) = check_gdb_support(config) {
+                    ignore_message = Some(Cow::Owned(msg));
+                }
+            }
+            Some(Debugger::Lldb) => {
+                if let Some(msg) = check_lldb_support(config) {
+                    ignore_message = Some(Cow::Owned(msg));
+                }
+            }
+            None => {}
         }
+    }
 
-        decision!(cfg::handle_ignore(&cache.cfg_conditions, ln));
-        decision!(cfg::handle_only(&cache.cfg_conditions, ln));
-        decision!(needs::handle_needs(&cache.needs, config, ln));
-        decision!(ignore_llvm(config, ln));
-        decision!(ignore_backends(config, ln));
-        decision!(needs_backends(config, ln));
-        decision!(ignore_cdb(config, ln));
-        decision!(ignore_gdb(config, ln));
-        decision!(ignore_lldb(config, ln));
-        decision!(ignore_parallel_frontend(config, ln));
+    if ignore_message.is_none() {
+        // Scan through the test file to handle `ignore-*`, `only-*`, and `needs-*` directives.
+        iter_directives(
+            config,
+            file_directives,
+            &mut |ln @ &DirectiveLine { line_number, .. }| {
+                if !ln.applies_to_test_revision(test_revision) {
+                    return;
+                }
 
-        if config.target == "wasm32-unknown-unknown"
-            && config.parse_name_directive(ln, directives::CHECK_RUN_RESULTS)
-        {
-            decision!(IgnoreDecision::Ignore {
-                reason: "ignored on WASM as the run results cannot be checked there".into(),
-            });
-        }
+                // Parse `aux-*` directives, for use by up-to-date checks.
+                parse_and_update_aux(config, ln, aux_props);
 
-        should_fail |= config.parse_name_directive(ln, "should-fail");
-    });
+                macro_rules! decision {
+                    ($e:expr) => {
+                        match $e {
+                            IgnoreDecision::Ignore { reason } => {
+                                ignore_message = Some(reason.into());
+                            }
+                            IgnoreDecision::Error { message } => {
+                                error!("{path}:{line_number}: {message}");
+                                *poisoned = true;
+                                return;
+                            }
+                            IgnoreDecision::Continue => {}
+                        }
+                    };
+                }
+
+                decision!(cfg::handle_ignore(&cache.cfg_conditions, ln));
+                decision!(cfg::handle_only(&cache.cfg_conditions, ln));
+                decision!(needs::handle_needs(&cache.needs, config, ln));
+                decision!(ignore_llvm(config, ln));
+                decision!(ignore_backends(config, ln));
+                decision!(needs_backends(config, ln));
+                decision!(ignore_cdb(config, ln));
+                decision!(ignore_gdb(config, ln));
+                decision!(ignore_lldb(config, ln));
+                decision!(ignore_parallel_frontend(config, ln));
+
+                if config.target == "wasm32-unknown-unknown"
+                    && config.parse_name_directive(ln, directives::CHECK_RUN_RESULTS)
+                {
+                    decision!(IgnoreDecision::Ignore {
+                        reason: "ignored on WASM as the run results cannot be checked there".into(),
+                    });
+                }
+
+                should_fail |= config.parse_name_directive(ln, "should-fail");
+            },
+        );
+    }
 
     // The `should-fail` annotation doesn't apply to pretty tests,
     // since we run the pretty printer across all tests by default.
@@ -1004,10 +988,35 @@ pub(crate) fn make_test_description(
     CollectedTestDesc {
         name,
         filterable_path: filterable_path.to_owned(),
-        ignore,
         ignore_message,
         should_fail,
     }
+}
+
+/// Returns `None` if CDB is available, otherwise returns an ignore message.
+fn check_cdb_support(config: &Config) -> Option<String> {
+    if config.cdb.is_none() { Some("cdb is not available".to_string()) } else { None }
+}
+
+/// Returns `None` if GDB is available, otherwise returns an ignore message.
+fn check_gdb_support(config: &Config) -> Option<String> {
+    if config.gdb_version.is_none() {
+        return Some("gdb is not available".to_string());
+    }
+
+    if config.matches_env("msvc") {
+        return Some("gdb tests do not run on msvc".to_string());
+    }
+
+    if config.remote_test_client.is_some() && !config.target.contains("android") {
+        return Some("gdb tests are not available when testing with remote".to_string());
+    }
+    None
+}
+
+/// Returns `None` if LLDB is available, otherwise returns an ignore message.
+fn check_lldb_support(config: &Config) -> Option<String> {
+    if config.lldb.is_none() { Some("lldb is not available".to_string()) } else { None }
 }
 
 fn ignore_cdb(config: &Config, line: &DirectiveLine<'_>) -> IgnoreDecision {
@@ -1092,21 +1101,46 @@ fn ignore_lldb(config: &Config, line: &DirectiveLine<'_>) -> IgnoreDecision {
         return IgnoreDecision::Continue;
     }
 
-    if let Some(actual_version) = config.lldb_version {
-        if line.name == "min-lldb-version"
-            && let Some(rest) = line.value_after_colon().map(str::trim)
-        {
-            let min_version = rest.parse().unwrap_or_else(|e| {
-                panic!("Unexpected format of LLDB version string: {}\n{:?}", rest, e);
-            });
-            // Ignore if actual version is smaller the minimum required
-            // version
-            if actual_version < min_version {
-                return IgnoreDecision::Ignore {
-                    reason: format!("ignored when the LLDB version is {rest}"),
+    if let Some(actual_version) = &config.lldb_version {
+        match (line.name, actual_version) {
+            ("min-apple-lldb-version", LldbVersion::Apple(vers)) => {
+                let Some(rest) = line.value_after_colon().map(str::trim) else {
+                    return IgnoreDecision::Continue;
                 };
+
+                let LldbVersion::Apple(min_vers) = LldbVersion::apple_from_str(rest) else {
+                    unreachable!()
+                };
+
+                if vers < &min_vers {
+                    return IgnoreDecision::Ignore {
+                        reason: format!(
+                            "ignored when the Apple LLDB version is {}.{}.{}.{}",
+                            vers[0], vers[1], vers[2], vers[3]
+                        ),
+                    };
+                }
             }
-        }
+            ("min-llvm-lldb-version", LldbVersion::Llvm(vers)) => {
+                let Some(rest) = line.value_after_colon().map(str::trim) else {
+                    return IgnoreDecision::Continue;
+                };
+
+                let LldbVersion::Llvm(min_vers) = LldbVersion::llvm_from_str(rest) else {
+                    unreachable!()
+                };
+
+                if vers < &min_vers {
+                    return IgnoreDecision::Ignore {
+                        reason: format!(
+                            "ignored when the LLDB version is {}.{}.{}",
+                            vers.major, vers.minor, vers.patch
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        };
     }
     IgnoreDecision::Continue
 }
@@ -1114,12 +1148,10 @@ fn ignore_lldb(config: &Config, line: &DirectiveLine<'_>) -> IgnoreDecision {
 fn ignore_backends(config: &Config, line: &DirectiveLine<'_>) -> IgnoreDecision {
     let path = line.file_path;
     if let Some(backends_to_ignore) = config.parse_name_value_directive(line, "ignore-backends") {
-        for backend in backends_to_ignore.split_whitespace().map(|backend| {
-            match CodegenBackend::try_from(backend) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    panic!("Invalid ignore-backends value `{backend}` in `{path}`: {error}")
-                }
+        for backend in backends_to_ignore.split_whitespace().map(|backend| match backend.parse() {
+            Ok(backend) => backend,
+            Err(error) => {
+                panic!("Invalid ignore-backends value `{backend}` in `{path}`: {error}")
             }
         }) {
             if !config.bypass_ignore_backends && config.default_codegen_backend == backend {
@@ -1137,7 +1169,7 @@ fn needs_backends(config: &Config, line: &DirectiveLine<'_>) -> IgnoreDecision {
     if let Some(needed_backends) = config.parse_name_value_directive(line, "needs-backends") {
         if !needed_backends
             .split_whitespace()
-            .map(|backend| match CodegenBackend::try_from(backend) {
+            .map(|backend| match backend.parse() {
                 Ok(backend) => backend,
                 Err(error) => {
                     panic!("Invalid needs-backends value `{backend}` in `{path}`: {error}")

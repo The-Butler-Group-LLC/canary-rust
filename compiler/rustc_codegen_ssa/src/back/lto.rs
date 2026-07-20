@@ -14,7 +14,7 @@ use tracing::info;
 use crate::back::symbol_export::{self, allocator_shim_symbols, symbol_name_for_instance_in_crate};
 use crate::back::write::CodegenContext;
 use crate::base::allocator_kind_for_codegen;
-use crate::errors::{DynamicLinkingWithLTO, LtoDisallowed, LtoDylib, LtoProcMacro};
+use crate::diagnostics::{DynamicLinkingWithLTO, LtoDisallowed, LtoDylib, LtoProcMacro};
 use crate::traits::*;
 
 pub struct ThinModule<B: WriteBackendMethods> {
@@ -85,7 +85,7 @@ fn crate_type_allows_lto(crate_type: CrateType) -> bool {
     }
 }
 
-pub(super) fn exported_symbols_for_lto(
+pub(crate) fn exported_symbols_for_lto(
     tcx: TyCtxt<'_>,
     each_linked_rlib_for_lto: &[CrateNum],
 ) -> Vec<String> {

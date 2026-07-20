@@ -40,7 +40,10 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn generate_enum_is_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn generate_enum_is_method(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_, '_>,
+) -> Option<()> {
     let variant = ctx.find_node_at_offset::<ast::Variant>()?;
     let parent_enum = ast::Adt::Enum(variant.parent_enum());
     let variants = variant
@@ -138,7 +141,7 @@ impl Method {
         };
 
         let variant_name = variant.name()?;
-        let fn_name = format!("is_{}", &to_lower_snake_case(&variant_name.text()));
+        let fn_name = format!("is_{}", to_lower_snake_case(&variant_name.text()));
         Some(Method { pattern_suffix, fn_name, variant_name })
     }
 }

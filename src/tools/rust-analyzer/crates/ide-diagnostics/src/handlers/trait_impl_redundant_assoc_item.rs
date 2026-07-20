@@ -1,4 +1,4 @@
-use hir::{HasSource, HirDisplay, db::ExpandDatabase};
+use hir::{HasSource, HirDisplay};
 use ide_db::text_edit::TextRange;
 use ide_db::{
     assists::{Assist, AssistId},
@@ -16,7 +16,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 //
 // Diagnoses redundant trait items in a trait impl.
 pub(crate) fn trait_impl_redundant_assoc_item(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TraitImplRedundantAssocItems,
 ) -> Diagnostic {
     let db = ctx.sema.db;
@@ -74,7 +74,7 @@ pub(crate) fn trait_impl_redundant_assoc_item(
 
 /// add assoc item into the trait def body
 fn quickfix_for_redundant_assoc_item(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TraitImplRedundantAssocItems,
     redundant_item_def: String,
     range: TextRange,
@@ -82,7 +82,7 @@ fn quickfix_for_redundant_assoc_item(
     let file_id = d.file_id.file_id()?;
     let add_assoc_item_def = |builder: &mut SourceChangeBuilder| -> Option<()> {
         let db = ctx.sema.db;
-        let root = db.parse_or_expand(d.file_id);
+        let root = d.file_id.parse_or_expand(db);
         // don't modify trait def in outer crate
         let impl_def = d.impl_.to_node(&root);
         let current_crate = ctx.sema.scope(impl_def.syntax())?.krate();

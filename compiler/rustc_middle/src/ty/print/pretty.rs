@@ -11,7 +11,7 @@ use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_hir::def::{self, CtorKind, DefKind, Namespace};
-use rustc_hir::def_id::{DefIdMap, DefIdSet, LOCAL_CRATE, ModDefId};
+use rustc_hir::def_id::{DefIdMap, DefIdSet, LOCAL_CRATE, ModId};
 use rustc_hir::definitions::{DefKey, DefPathDataName};
 use rustc_hir::limit::Limit;
 use rustc_macros::{Lift, extension};
@@ -190,6 +190,10 @@ pub struct RegionHighlightMode<'tcx> {
     /// instead of the ordinary behavior.
     highlight_regions: [Option<(ty::Region<'tcx>, usize)>; 3],
 
+    /// If set to `true`, types that include regions will always be included in the output, while
+    /// other types will be free to be trimmed.
+    pub keep_regions: bool,
+
     /// If enabled, when printing a "free region" that originated from
     /// the given `ty::BoundRegionKind`, print it as "`'1`". Free regions that would ordinarily
     /// have names print as normal.
@@ -208,6 +212,7 @@ impl<'tcx> RegionHighlightMode<'tcx> {
         region: Option<ty::Region<'tcx>>,
         number: Option<usize>,
     ) {
+        self.keep_regions = true;
         if let Some(k) = region
             && let Some(n) = number
         {
@@ -223,6 +228,7 @@ impl<'tcx> RegionHighlightMode<'tcx> {
                 bug!("can only highlight {} placeholders at a time", num_slots,)
             });
         *first_avail_slot = Some((region, number));
+        self.keep_regions = true;
     }
 
     /// Convenience wrapper for `highlighting_region`.
@@ -265,7 +271,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
 
     fn pretty_print_in_binder<T>(&mut self, value: &ty::Binder<'tcx, T>) -> Result<(), PrintError>
     where
-        T: Print<'tcx, Self> + TypeFoldable<TyCtxt<'tcx>>,
+        T: Print<Self> + TypeFoldable<TyCtxt<'tcx>>,
     {
         value.as_ref().skip_binder().print(self)
     }
@@ -285,7 +291,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
     /// Prints comma-separated elements.
     fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
     where
-        T: Print<'tcx, Self>,
+        T: Print<Self>,
     {
         if let Some(first) = elems.next() {
             first.print(self)?;
@@ -385,8 +391,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                 && Some(*visible_parent) != actual_parent
             {
                 this.tcx()
-                    // FIXME(typed_def_id): Further propagate ModDefId
-                    .module_children(ModDefId::new_unchecked(*visible_parent))
+                    .module_children(ModId::new_unchecked(*visible_parent))
                     .iter()
                     .filter(|child| child.res.opt_def_id() == Some(def_id))
                     .find(|child| child.vis.is_public() && child.ident.name != kw::Underscore)
@@ -612,8 +617,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                 // that's public and whose identifier isn't `_`.
                 let reexport = self
                     .tcx()
-                    // FIXME(typed_def_id): Further propagate ModDefId
-                    .module_children(ModDefId::new_unchecked(visible_parent))
+                    .module_children(ModId::new_unchecked(visible_parent))
                     .iter()
                     .filter(|child| child.res.opt_def_id() == Some(def_id))
                     .find(|child| child.vis.is_public() && child.ident.name != kw::Underscore)
@@ -743,6 +747,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                 write!(self, ")")?;
             }
             ty::FnDef(def_id, args) => {
+                let args = args.no_bound_vars().unwrap();
                 if with_reduced_queries() {
                     self.print_def_path(def_id, args)?;
                 } else {
@@ -751,7 +756,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                     if self.tcx().codegen_fn_attrs(def_id).safe_target_features {
                         write!(self, "#[target_features] ")?;
                         sig = sig.map_bound(|mut sig| {
-                            sig.fn_sig_kind = sig.fn_sig_kind.set_safe(true);
+                            sig.fn_sig_kind = sig.fn_sig_kind.set_safety(hir::Safety::Safe);
                             sig
                         });
                     }
@@ -820,13 +825,14 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
             }
             ty::Foreign(def_id) => self.print_def_path(def_id, &[])?,
             ty::Alias(
+                _,
                 ref data @ ty::AliasTy {
                     kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. },
                     ..
                 },
             ) => data.print(self)?,
             ty::Placeholder(placeholder) => placeholder.print(self)?,
-            ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
                 // We use verbose printing in 'NO_QUERIES' mode, to
                 // avoid needing to call `predicates_of`. This should
                 // only affect certain debug messages (e.g. messages printed
@@ -846,12 +852,13 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                     DefKind::TyAlias | DefKind::AssocTy => {
                         // NOTE: I know we should check for NO_QUERIES here, but it's alright.
                         // `type_of` on a type alias or assoc type should never cause a cycle.
-                        if let ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: d }, .. }) = *self
-                            .tcx()
-                            .type_of(parent)
-                            .instantiate_identity()
-                            .skip_norm_wip()
-                            .kind()
+                        if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: d }, .. }) =
+                            *self
+                                .tcx()
+                                .type_of(parent)
+                                .instantiate_identity()
+                                .skip_norm_wip()
+                                .kind()
                         {
                             if d == def_id {
                                 // If the type alias directly starts with the `impl` of the
@@ -1344,17 +1351,18 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
 
     fn pretty_print_inherent_projection(
         &mut self,
-        alias_ty: ty::AliasTerm<'tcx>,
+        alias_term: ty::AliasTerm<'tcx>,
     ) -> Result<(), PrintError> {
-        let def_key = self.tcx().def_key(alias_ty.def_id());
+        let alias_def_id = alias_term.expect_inherent_def_id();
+        let def_key = self.tcx().def_key(alias_def_id);
         self.print_path_with_generic_args(
             |p| {
                 p.print_path_with_simple(
-                    |p| p.print_path_with_qualified(alias_ty.self_ty(), None),
+                    |p| p.print_path_with_qualified(alias_term.self_ty(), None),
                     &def_key.disambiguated_data,
                 )
             },
-            &alias_ty.args[1..],
+            &alias_term.args[1..],
         )
     }
 
@@ -1366,12 +1374,16 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         let fn_args = if self.tcx().features().return_type_notation()
             && let Some(ty::ImplTraitInTraitData::Trait { fn_def_id, .. }) =
                 self.tcx().opt_rpitit_info(def_id)
-            && let ty::Alias(alias_ty) =
+            && let ty::Alias(_, alias_ty) =
                 self.tcx().fn_sig(fn_def_id).skip_binder().output().skip_binder().kind()
-            && alias_ty.kind.def_id() == def_id
+            && let Some(projection_ty) = alias_ty.try_to_projection()
+            && projection_ty.kind == def_id
             && let generics = self.tcx().generics_of(fn_def_id)
             // FIXME(return_type_notation): We only support lifetime params for now.
-            && generics.own_params.iter().all(|param| matches!(param.kind, ty::GenericParamDefKind::Lifetime))
+            && generics
+                .own_params
+                .iter()
+                .all(|param| matches!(param.kind, ty::GenericParamDefKind::Lifetime))
         {
             let num_args = generics.count();
             Some((fn_def_id, &args[..num_args]))
@@ -1428,6 +1440,8 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             p.pretty_print_fn_sig(
                                 tys,
                                 false,
+                                // FIXME(splat): support splatted arguments here?
+                                None,
                                 proj.skip_binder().term.as_type().expect("Return type was a const"),
                             )?;
                             resugared = true;
@@ -1531,10 +1545,19 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         &mut self,
         inputs: &[Ty<'tcx>],
         c_variadic: bool,
+        splatted: Option<u8>,
         output: Ty<'tcx>,
     ) -> Result<(), PrintError> {
         write!(self, "(")?;
-        self.comma_sep(inputs.iter().copied())?;
+        let splatted_arg_index = splatted.map(usize::from);
+        let mut input_iter = inputs.iter().copied();
+        if let Some(index) = splatted_arg_index {
+            self.comma_sep((&mut input_iter).take(usize::from(index)))?;
+            write!(self, ", #[splat]")?;
+            self.comma_sep(input_iter)?;
+        } else {
+            self.comma_sep(input_iter)?;
+        }
         if c_variadic {
             if !inputs.is_empty() {
                 write!(self, ", ")?;
@@ -1561,14 +1584,16 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
         }
 
         match ct.kind() {
-            ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, args }) => {
-                match self.tcx().def_kind(def) {
-                    DefKind::Const { .. } | DefKind::AssocConst { .. } => {
-                        self.pretty_print_value_path(def, args)?;
+            ty::ConstKind::Alias(_, ty::AliasConst { kind, args, .. }) => {
+                match kind {
+                    ty::AliasConstKind::Projection { def_id }
+                    | ty::AliasConstKind::Inherent { def_id }
+                    | ty::AliasConstKind::Free { def_id } => {
+                        self.pretty_print_value_path(def_id, args)?;
                     }
-                    DefKind::AnonConst => {
-                        if def.is_local()
-                            && let span = self.tcx().def_span(def)
+                    ty::AliasConstKind::Anon { def_id } => {
+                        if def_id.is_local()
+                            && let span = self.tcx().def_span(def_id)
                             && let Ok(snip) = self.tcx().sess.source_map().span_to_snippet(span)
                         {
                             write!(self, "{snip}")?;
@@ -1583,12 +1608,11 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             write!(
                                 self,
                                 "{}::{}",
-                                self.tcx().crate_name(def.krate),
-                                self.tcx().def_path(def).to_string_no_crate_verbose()
+                                self.tcx().crate_name(def_id.krate),
+                                self.tcx().def_path(def_id).to_string_no_crate_verbose()
                             )?;
                         }
                     }
-                    defkind => bug!("`{:?}` has unexpected defkind {:?}", ct, defkind),
                 }
             }
             ty::ConstKind::Infer(infer_ct) => match infer_ct {
@@ -2012,7 +2036,8 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
             }
             (_, ty::FnDef(def_id, args)) => {
                 // Never allowed today, but we still encounter them in invalid const args.
-                self.pretty_print_value_path(def_id, args)?;
+                // FIXME(addiesh): fix wrt late-bound stuff
+                self.pretty_print_value_path(def_id, args.no_bound_vars().unwrap())?;
                 return Ok(());
             }
             // FIXME(oli-obk): also pretty print arrays and other aggregate constants by reading
@@ -2082,10 +2107,9 @@ pub(crate) fn pretty_print_const<'tcx>(
     print_types: bool,
 ) -> fmt::Result {
     ty::tls::with(|tcx| {
-        let literal = tcx.lift(c).unwrap();
         let mut p = FmtPrinter::new(tcx, Namespace::ValueNS);
         p.print_alloc_ids = true;
-        p.pretty_print_const(literal, print_types)?;
+        p.pretty_print_const(tcx.lift(c), print_types)?;
         fmt.write_str(&p.into_buffer())?;
         Ok(())
     })
@@ -2310,12 +2334,70 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
     }
 
     fn print_type(&mut self, ty: Ty<'tcx>) -> Result<(), PrintError> {
+        let has_regions = self.region_highlight_mode.keep_regions
+            && ty.has_type_flags(ty::TypeFlags::HAS_REGIONS);
         match ty.kind() {
-            ty::Tuple(tys) if tys.len() == 0 && self.should_truncate() => {
+            ty::Tuple(tys) if tys.len() == 0 => {
                 // Don't truncate `()`.
+                self.pretty_print_type(ty)
+            }
+
+            ty::Adt(def, args)
+                if self.should_truncate()
+                    && args.consts().count() < 2
+                    && args.types().count() < 2
+                    && {
+                        // We ensure that if there's at most a single type parameter and that type
+                        // *doesn't* have any parameters, to avoid printing all the names in cases
+                        // like `Foo<Foo<Foo<Foo<...>>>`, instead truncating those always to
+                        // `Foo<...>`.
+                        if let Some(arg) = args.types().next() {
+                            if let ty::Adt(_, arg_args) = arg.kind() {
+                                if arg_args.consts().next().is_none()
+                                    && arg_args.types().next().is_none()
+                                {
+                                    // Single param type with no type or const parameters:
+                                    // `Foo<Bar<'a>>`.
+                                    true
+                                } else {
+                                    // Single param type with multiple type or const parameters:
+                                    // `Foo<Bar<Baz, Qux>>`. We don't want to recurse into those,
+                                    // we'll replace the whole thing with `...`.
+                                    false
+                                }
+                            } else {
+                                // Single type param that *isn't* a type with parameters, like a
+                                // primitive: `Foo<i32>`.
+                                true
+                            }
+                        } else {
+                            // No type param: `Foo`.
+                            true
+                        }
+                    }
+                    && self.tcx.item_name(def.did()).as_str().len() < 7 =>
+            {
+                // Don't fully truncate types that have "short names" and at most one type or const
+                // param. We do use the short path for them (only item name instead of full path).
+                with_forced_trimmed_paths!(self.pretty_print_type(ty))
+            }
+
+            ty::Alias(_, alias)
+                if self.should_truncate()
+                    && let ty::AliasTyKind::Opaque { def_id } = alias.kind
+                    && self.region_highlight_mode.keep_regions
+                    && self
+                        .tcx
+                        .explicit_item_bounds(def_id)
+                        .iter_instantiated_copied(self.tcx, alias.args)
+                        .map(Unnormalized::skip_norm_wip)
+                        .any(|(value, _)| value.has_bound_vars()) =>
+            {
+                // `<impl for<'a> Trait as Trait>`
                 self.printed_type_count += 1;
                 self.pretty_print_type(ty)
             }
+
             ty::Adt(..)
             | ty::Foreign(_)
             | ty::Pat(..)
@@ -2325,23 +2407,23 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
             | ty::FnPtr(..)
             | ty::UnsafeBinder(..)
             | ty::Dynamic(..)
-            | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
             | ty::Tuple(_)
             | ty::Alias(..)
-            | ty::Param(_)
             | ty::Bound(..)
             | ty::Placeholder(_)
             | ty::Error(_)
-                if self.should_truncate() =>
+                if self.should_truncate() && !has_regions =>
             {
                 // We only truncate types that we know are likely to be much longer than 3 chars.
                 // There's no point in replacing `i32` or `!`.
-                write!(self, "...")?;
+                write!(self, "_")?;
                 Ok(())
             }
+            ty::Ref(..) if self.should_truncate() && has_regions => self.pretty_print_type(ty),
+            ty::Closure(..) => self.pretty_print_type(ty),
             _ => {
                 self.printed_type_count += 1;
                 self.pretty_print_type(ty)
@@ -2485,7 +2567,7 @@ impl<'tcx> PrettyPrinter<'tcx> for FmtPrinter<'_, 'tcx> {
 
     fn pretty_print_in_binder<T>(&mut self, value: &ty::Binder<'tcx, T>) -> Result<(), PrintError>
     where
-        T: Print<'tcx, Self> + TypeFoldable<TyCtxt<'tcx>>,
+        T: Print<Self> + TypeFoldable<TyCtxt<'tcx>>,
     {
         self.wrap_binder(value, WrapBinderMode::ForAll, |new_value, this| new_value.print(this))
     }
@@ -2941,18 +3023,18 @@ impl<'tcx> FmtPrinter<'_, 'tcx> {
     }
 }
 
-impl<'tcx, T, P: PrettyPrinter<'tcx>> Print<'tcx, P> for ty::Binder<'tcx, T>
+impl<'tcx, T, P: PrettyPrinter<'tcx>> Print<P> for ty::Binder<'tcx, T>
 where
-    T: Print<'tcx, P> + TypeFoldable<TyCtxt<'tcx>>,
+    T: Print<P> + TypeFoldable<TyCtxt<'tcx>>,
 {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         p.pretty_print_in_binder(self)
     }
 }
 
-impl<'tcx, T, P: PrettyPrinter<'tcx>> Print<'tcx, P> for ty::OutlivesPredicate<'tcx, T>
+impl<'tcx, T, P: PrettyPrinter<'tcx>> Print<P> for ty::OutlivesPredicate<'tcx, T>
 where
-    T: Print<'tcx, P>,
+    T: Print<P>,
 {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         self.0.print(p)?;
@@ -2971,7 +3053,7 @@ pub struct TraitRefPrintOnlyTraitPath<'tcx>(ty::TraitRef<'tcx>);
 impl<'tcx> rustc_errors::IntoDiagArg for TraitRefPrintOnlyTraitPath<'tcx> {
     fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         ty::tls::with(|tcx| {
-            let trait_ref = tcx.short_string(self, path);
+            let trait_ref = tcx.short_string(tcx.lift(self), path);
             rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(trait_ref))
         })
     }
@@ -2991,7 +3073,7 @@ pub struct TraitRefPrintSugared<'tcx>(ty::TraitRef<'tcx>);
 impl<'tcx> rustc_errors::IntoDiagArg for TraitRefPrintSugared<'tcx> {
     fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         ty::tls::with(|tcx| {
-            let trait_ref = tcx.short_string(self, path);
+            let trait_ref = tcx.short_string(tcx.lift(self), path);
             rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(trait_ref))
         })
     }
@@ -3098,7 +3180,6 @@ macro_rules! forward_display_to_print {
                 ty::tls::with(|tcx| {
                     let mut p = FmtPrinter::new(tcx, Namespace::TypeNS);
                     tcx.lift(*self)
-                        .expect("could not lift for printing")
                         .print(&mut p)?;
                     f.write_str(&p.into_buffer())?;
                     Ok(())
@@ -3110,7 +3191,7 @@ macro_rules! forward_display_to_print {
 
 macro_rules! define_print {
     (($self:ident, $p:ident): $($ty:ty $print:block)+) => {
-        $(impl<'tcx, P: PrettyPrinter<'tcx>> Print<'tcx, P> for $ty {
+        $(impl<'tcx, P: PrettyPrinter<'tcx>> Print<P> for $ty {
             fn print(&$self, $p: &mut P) -> Result<(), PrintError> {
                 let _: () = $print;
                 Ok(())
@@ -3144,7 +3225,7 @@ define_print! {
         }
 
         write!(p, "fn")?;
-        p.pretty_print_fn_sig(self.inputs(), self.c_variadic(), self.output())?;
+        p.pretty_print_fn_sig(self.inputs(), self.c_variadic(), self.splatted(), self.output())?;
     }
 
     ty::TraitRef<'tcx> {
@@ -3157,8 +3238,10 @@ define_print! {
     }
 
     ty::AliasTerm<'tcx> {
-        match self.kind(p.tcx()) {
-            ty::AliasTermKind::InherentTy {..} | ty::AliasTermKind::InherentConst {..} => p.pretty_print_inherent_projection(*self)?,
+        match self.kind {
+            ty::AliasTermKind::InherentTy { .. } | ty::AliasTermKind::InherentConst { .. } => {
+                p.pretty_print_inherent_projection(*self)?;
+            }
             ty::AliasTermKind::ProjectionTy { def_id } => {
                 if !(p.should_print_verbose() || with_reduced_queries())
                     && p.tcx().is_impl_trait_in_trait(def_id)
@@ -3171,7 +3254,7 @@ define_print! {
             ty::AliasTermKind::FreeTy { def_id }
             | ty::AliasTermKind::FreeConst { def_id }
             | ty::AliasTermKind::OpaqueTy { def_id }
-            | ty::AliasTermKind::UnevaluatedConst { def_id }
+            | ty::AliasTermKind::AnonConst { def_id }
             | ty::AliasTermKind::ProjectionConst { def_id } => {
                 p.print_def_path(def_id, self.args)?;
             }
@@ -3250,11 +3333,6 @@ define_print! {
             }
             ty::PredicateKind::Ambiguous => write!(p, "ambiguous")?,
             ty::PredicateKind::NormalizesTo(data) => data.print(p)?,
-            ty::PredicateKind::AliasRelate(t1, t2, dir) => {
-                t1.print(p)?;
-                write!(p, " {dir} ")?;
-                t2.print(p)?;
-            }
         }
     }
 
@@ -3267,9 +3345,9 @@ define_print! {
     }
 
     ty::ExistentialTraitRef<'tcx> {
-        // Use a type that can't appear in defaults of type parameters.
-        let dummy_self = Ty::new_fresh(p.tcx(), 0);
-        let trait_ref = self.with_self_ty(p.tcx(), dummy_self);
+        // Dummy Self is safe to use as it can't appear in generic param defaults which is important
+        // later on for correctly eliding generic args that coincide with their default.
+        let trait_ref = self.with_self_ty(p.tcx(), p.tcx().types.trait_object_dummy_self);
         trait_ref.print_only_trait_path().print(p)?;
     }
 
@@ -3402,6 +3480,29 @@ define_print_and_forward_display! {
 
     ty::Clause<'tcx> {
         self.kind().print(p)?;
+    }
+
+    ty::UserTypeKind<'tcx> {
+        match *self {
+            Self::Ty(ty) => {
+                write!(p, "Ty(")?;
+                ty.print(p)?;
+            }
+            Self::TypeOf(def_id, ty::UserArgs { args, user_self_ty }) => {
+                write!(p, "TypeOf(")?;
+                p.print_def_path(def_id, args)?;
+                if let Some(ty::UserSelfTy { impl_def_id, self_ty }) = user_self_ty {
+                    write!(p, " at <impl ")?;
+                    let key = p.tcx().def_key(impl_def_id);
+                    let parent_def_id = DefId { index: key.parent.unwrap(), ..impl_def_id };
+                    p.print_def_path(parent_def_id, &[])?;
+                    write!(p, "::<{}> for ", key.disambiguated_data.as_sym(false))?;
+                    self_ty.print(p)?;
+                    write!(p, ">")?;
+                }
+            }
+        }
+        write!(p, ")")?;
     }
 
     GenericArg<'tcx> {

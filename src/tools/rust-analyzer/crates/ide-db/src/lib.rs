@@ -63,10 +63,7 @@ use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, Nonce, SourceDatabase,
     SourceRoot, SourceRootId, SourceRootInput, set_all_crates_with_durability,
 };
-use hir::{
-    FilePositionWrapper, FileRangeWrapper,
-    db::{DefDatabase, ExpandDatabase, HirDatabase},
-};
+use hir::{FilePositionWrapper, FileRangeWrapper, db::HirDatabase};
 use triomphe::Arc;
 
 use crate::line_index::LineIndex;
@@ -112,7 +109,7 @@ impl Clone for RootDatabase {
             storage: self.storage.clone(),
             files: self.files.clone(),
             crates_map: self.crates_map.clone(),
-            nonce: Nonce::new(),
+            nonce: self.nonce,
         }
     }
 }
@@ -160,7 +157,7 @@ impl SourceDatabase for RootDatabase {
     }
 
     fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {
-        self.files.file_source_root(id)
+        self.files.file_source_root(self, id)
     }
 
     fn set_file_source_root_with_durability(
@@ -179,6 +176,10 @@ impl SourceDatabase for RootDatabase {
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
         (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
+    }
+
+    fn line_column(&self, file: FileId, offset: syntax::TextSize) -> Result<(u32, u32), ()> {
+        line_index(self, file).try_line_col(offset).map(|lc| (lc.line, lc.col)).ok_or(())
     }
 }
 
@@ -199,20 +200,20 @@ impl RootDatabase {
         // This needs to be here otherwise `CrateGraphBuilder` will panic.
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
         CrateGraphBuilder::default().set_in_db(&mut db);
-        db.set_proc_macros_with_durability(Default::default(), Durability::MEDIUM);
+        hir::ProcMacros::init_default(&db, Durability::MEDIUM);
         _ = base_db::LibraryRoots::builder(Default::default())
             .durability(Durability::MEDIUM)
             .new(&db);
         _ = base_db::LocalRoots::builder(Default::default())
             .durability(Durability::MEDIUM)
             .new(&db);
-        db.set_expand_proc_attr_macros_with_durability(false, Durability::HIGH);
+        hir::db::set_expand_proc_attr_macros(&mut db, false);
         db.update_base_query_lru_capacities(lru_capacity);
         db
     }
 
     pub fn enable_proc_attr_macros(&mut self) {
-        self.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
+        hir::db::set_expand_proc_attr_macros(self, true);
     }
 
     pub fn update_base_query_lru_capacities(&mut self, _lru_capacity: Option<u16>) {
@@ -402,10 +403,16 @@ impl<'a> MiniCore<'a> {
 
 impl std::fmt::Debug for MiniCore<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("MiniCore")
-            // don't print the whole contents if they correspond to the default
-            .field(if self.0 == test_utils::MiniCore::RAW_SOURCE { &"<default>" } else { &self.0 })
-            .finish()
+        let mut d = f.debug_tuple("MiniCore");
+        if self.0 == test_utils::MiniCore::RAW_SOURCE {
+            // Don't print the whole contents if they correspond to the default.
+            // The `format_args!` makes it so that the output is
+            // `MiniCore(<default>)` and not `MiniCore("<default>").
+            d.field(&format_args!("<default>"));
+        } else {
+            d.field(&self.0);
+        };
+        d.finish()
     }
 }
 

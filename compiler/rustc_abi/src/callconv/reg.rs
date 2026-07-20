@@ -1,9 +1,9 @@
 #[cfg(feature = "nightly")]
-use rustc_macros::HashStable_Generic;
+use rustc_macros::StableHash;
 
 use crate::{Align, HasDataLayout, Integer, Primitive, Size};
 
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RegKind {
     Integer,
@@ -16,7 +16,7 @@ pub enum RegKind {
     },
 }
 
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Reg {
     pub kind: RegKind,
@@ -69,7 +69,7 @@ impl Reg {
                 128 => dl.f128_align,
                 _ => panic!("unsupported float: {self:?}"),
             },
-            RegKind::Vector { .. } => dl.llvmlike_vector_align(self.size),
+            RegKind::Vector { .. } => dl.rust_vector_align(self.size),
         }
     }
 }

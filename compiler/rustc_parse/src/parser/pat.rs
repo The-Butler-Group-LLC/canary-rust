@@ -12,12 +12,12 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, Diag, DiagArgValue, PResult, StashKey};
-use rustc_session::errors::ExprParenthesesNeeded;
+use rustc_session::diagnostics::ExprParenthesesNeeded;
 use rustc_span::{BytePos, ErrorGuaranteed, Ident, Span, Spanned, kw, respan, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use super::{ForceCollect, Parser, PathStyle, Restrictions, Trailing, UsePreAttrPos};
-use crate::errors::{
+use crate::diagnostics::{
     self, AmbiguousRangePattern, AtDotDotInStructPattern, AtInStructPattern,
     DotDotDotForRemainingFields, DotDotDotRangeToPatternNotAllowed, DotDotDotRestPattern,
     EnumPatternInsteadOfIdentifier, ExpectedBindingLeftOfAt, ExpectedCommaAfterPatternField,
@@ -367,14 +367,15 @@ impl<'a> Parser<'a> {
         match (is_end_ahead, &self.token.kind) {
             (true, token::Or | token::OrOr) => {
                 // A `|` or possibly `||` token shouldn't be here. Ban it.
+                let token = pprust::token_to_string(&self.token);
                 self.dcx().emit_err(TrailingVertNotAllowed {
                     span: self.token.span,
                     start: lo,
                     suggestion: TrailingVertSuggestion {
                         span: self.prev_token.span.shrink_to_hi().with_hi(self.token.span.hi()),
-                        token: self.token,
+                        token: token.clone(),
                     },
-                    token: self.token,
+                    token,
                     note_double_vert: self.token.kind == token::OrOr,
                 });
                 self.bump();
@@ -496,18 +497,14 @@ impl<'a> Parser<'a> {
                 && self.look_ahead(1, Token::is_range_separator);
 
         let span = expr.span;
+        let mut diag = self.dcx().create_err(UnexpectedExpressionInPattern { span, is_bound });
+        // The unexpected expr's precedence. Not used directly in the error message, but
+        // needed for the stashing of this error to work correctly. We store a `u32` rather
+        // than an `ExprPrecedence` to avoid having to impl `IntoDiagArg` for
+        // `ExprPrecedence`.
+        diag.arg("expr_precedence", expr.precedence() as u32);
 
-        Some((
-            self.dcx()
-                .create_err(UnexpectedExpressionInPattern {
-                    span,
-                    is_bound,
-                    expr_precedence: expr.precedence(),
-                })
-                .stash(span, StashKey::ExprInPat)
-                .unwrap(),
-            span,
-        ))
+        Some((diag.stash(span, StashKey::ExprInPat).unwrap(), span))
     }
 
     /// Called by [`Parser::parse_stmt_without_recovery`], used to add statement-aware subdiagnostics to the errors stashed
@@ -919,7 +916,7 @@ impl<'a> Parser<'a> {
             // The user probably mistook `...` for a rest pattern `..`.
             self.dcx().emit_err(DotDotDotRestPattern {
                 span: lo,
-                suggestion: Some(lo.with_lo(lo.hi() - BytePos(1))),
+                suggestion: Some(lo),
                 var_args: None,
             });
             PatKind::Rest
@@ -1477,7 +1474,7 @@ impl<'a> Parser<'a> {
 
         if self.isnt_pattern_start() {
             let descr = super::token_descr(&self.token);
-            self.dcx().emit_err(errors::BoxNotPat {
+            self.dcx().emit_err(diagnostics::BoxNotPat {
                 span: self.token.span,
                 kw: box_span,
                 lo: box_span.shrink_to_lo(),
@@ -1788,6 +1785,6 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn mk_pat(&self, span: Span, kind: PatKind) -> Pat {
-        Pat { kind, span, id: ast::DUMMY_NODE_ID, tokens: None }
+        Pat { kind, span, id: ast::DUMMY_NODE_ID }
     }
 }

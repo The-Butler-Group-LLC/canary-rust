@@ -1,15 +1,15 @@
 use rustc_ast::Safety;
 use rustc_errors::{Diagnostic, MultiSpan};
 use rustc_hir::AttrPath;
+use rustc_lint_defs::builtin::UNSAFE_CODE;
 use rustc_session::lint::LintId;
 use rustc_session::lint::builtin::UNSAFE_ATTR_OUTSIDE_UNSAFE;
 use rustc_span::Span;
 
 use crate::attributes::AttributeSafety;
-use crate::context::Stage;
-use crate::{AttributeParser, EmitAttribute, ShouldEmit, errors};
+use crate::{AttributeParser, EmitAttribute, ShouldEmit, diagnostics};
 
-impl<'sess, S: Stage> AttributeParser<'sess, S> {
+impl<'sess> AttributeParser<'sess> {
     pub fn check_attribute_safety(
         &mut self,
         attr_path: &AttrPath,
@@ -18,20 +18,23 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
         expected_safety: AttributeSafety,
         emit_lint: &mut impl FnMut(LintId, MultiSpan, EmitAttribute),
     ) {
-        if matches!(self.stage.should_emit(), ShouldEmit::Nothing) {
+        if matches!(self.should_emit, ShouldEmit::Nothing) {
             return;
         }
 
+        // Check if expected & actual safety match
         match (expected_safety, attr_safety) {
-            // - Unsafe builtin attribute
-            // - User wrote `#[unsafe(..)]`, which is permitted on any edition
-            (AttributeSafety::Unsafe { .. }, Safety::Unsafe(..)) => {
+            // - An unsafe builtin attribute, where the user wrote `#[unsafe(..)]`,
+            // which is permitted on any edition
+            // - A normal builtin attribute, where no explicit `#[unsafe(..)]` was written.
+            (AttributeSafety::Unsafe { .. }, Safety::Unsafe(..))
+            | (AttributeSafety::Normal, Safety::Default) => {
                 // OK
             }
 
             // - Unsafe builtin attribute
             // - User did not write `#[unsafe(..)]`
-            (AttributeSafety::Unsafe { unsafe_since }, Safety::Default) => {
+            (AttributeSafety::Unsafe { unsafe_since, note: _ }, Safety::Default) => {
                 let path_span = attr_path.span;
 
                 // If the `attr_item`'s span is not from a macro, then just suggest
@@ -56,31 +59,28 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                     && let Ok(mut snippet) = self.sess.source_map().span_to_snippet(diag_span)
                 {
                     snippet.retain(|c| !c.is_whitespace());
-                    if snippet.contains("!(") || snippet.starts_with("#[") && snippet.ends_with("]")
+                    if snippet.contains("!(") || snippet.starts_with("#[") && snippet.ends_with(']')
                     {
                         not_from_proc_macro = false;
                     }
                 }
 
                 if emit_error {
-                    self.stage.emit_err(
-                        self.sess,
-                        crate::session_diagnostics::UnsafeAttrOutsideUnsafe {
-                            span: path_span,
-                            suggestion: not_from_proc_macro.then(|| {
-                                crate::session_diagnostics::UnsafeAttrOutsideUnsafeSuggestion {
-                                    left: diag_span.shrink_to_lo(),
-                                    right: diag_span.shrink_to_hi(),
-                                }
-                            }),
-                        },
-                    );
+                    self.emit_err(crate::session_diagnostics::UnsafeAttrOutsideUnsafe {
+                        span: path_span,
+                        suggestion: not_from_proc_macro.then(|| {
+                            crate::session_diagnostics::UnsafeAttrOutsideUnsafeSuggestion {
+                                left: diag_span.shrink_to_lo(),
+                                right: diag_span.shrink_to_hi(),
+                            }
+                        }),
+                    });
                 } else {
                     emit_lint(
                         LintId::of(UNSAFE_ATTR_OUTSIDE_UNSAFE),
                         path_span.into(),
                         EmitAttribute(Box::new(move |dcx, level, _| {
-                            errors::UnsafeAttrOutsideUnsafeLint {
+                            diagnostics::UnsafeAttrOutsideUnsafeLint {
                                 span: path_span,
                                 suggestion: not_from_proc_macro
                                     .then(|| (diag_span.shrink_to_lo(), diag_span.shrink_to_hi()))
@@ -97,19 +97,10 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
             // - Normal builtin attribute
             // - Writing `#[unsafe(..)]` is not permitted on normal builtin attributes
             (AttributeSafety::Normal, Safety::Unsafe(unsafe_span)) => {
-                self.stage.emit_err(
-                    self.sess,
-                    crate::session_diagnostics::InvalidAttrUnsafe {
-                        span: unsafe_span,
-                        name: attr_path.clone(),
-                    },
-                );
-            }
-
-            // - Normal builtin attribute
-            // - No explicit `#[unsafe(..)]` written.
-            (AttributeSafety::Normal, Safety::Default) => {
-                // OK
+                self.emit_err(crate::session_diagnostics::InvalidAttrUnsafe {
+                    span: unsafe_span,
+                    name: attr_path.clone(),
+                });
             }
 
             (_, Safety::Safe(..)) => {
@@ -118,6 +109,18 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                     "`check_attribute_safety` does not expect `Safety::Safe` on attributes",
                 );
             }
+        }
+
+        // Emit `unsafe_code` lint
+        if let AttributeSafety::Unsafe { note, .. } = expected_safety {
+            let attr_path = attr_path.clone();
+            emit_lint(
+                LintId::of(UNSAFE_CODE),
+                attr_span.into(),
+                EmitAttribute(Box::new(move |dcx, level, _| {
+                    diagnostics::UnsafeAttribute { attr_path, note }.into_diag(dcx, level)
+                })),
+            )
         }
     }
 }

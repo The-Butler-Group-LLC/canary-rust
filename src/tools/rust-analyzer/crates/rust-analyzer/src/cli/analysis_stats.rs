@@ -2,6 +2,7 @@
 //! errors.
 
 use std::{
+    cell::LazyCell,
     env, fmt,
     ops::AddAssign,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -11,16 +12,17 @@ use std::{
 use cfg::{CfgAtom, CfgDiff};
 use hir::{
     Adt, AssocItem, Crate, DefWithBody, FindPathConfig, GenericDef, HasCrate, HasSource,
-    HirDisplay, ModuleDef, Name, Variant, VariantId, crate_lang_items,
-    db::{DefDatabase, ExpandDatabase, HirDatabase},
-    next_solver::{DbInterner, GenericArgs},
+    HirDisplay, ModuleDef, Name, Variant, crate_lang_items, db::HirDatabase,
 };
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, SyntheticSyntax,
     expr_store::{Body, BodySourceMap, ExpressionStore},
     hir::{ExprId, PatId, generics::GenericParams},
 };
-use hir_ty::InferenceResult;
+use hir_ty::{
+    InferenceResult,
+    next_solver::{DbInterner, GenericArgs},
+};
 use ide::{
     Analysis, AnalysisHost, AnnotationConfig, DiagnosticsConfig, Edition, InlayFieldsToResolve,
     InlayHintsConfig, LineCol, RaFixtureConfig, RootDatabase,
@@ -148,26 +150,26 @@ impl flags::AnalysisStats {
                     // measure workspace/project code
                     if !source_root.is_library || self.with_deps {
                         let length = db.file_text(file_id).text(db).lines().count();
-                        let item_stats = db
-                            .file_item_tree(
-                                EditionedFileId::current_edition(db, file_id).into(),
-                                krate.into(),
-                            )
-                            .item_tree_stats()
-                            .into();
+                        let item_stats = hir::db::file_item_tree(
+                            db,
+                            EditionedFileId::current_edition(db, file_id).into(),
+                            krate.into(),
+                        )
+                        .item_tree_stats()
+                        .into();
 
                         workspace_loc += length;
                         workspace_item_trees += 1;
                         workspace_item_stats += item_stats;
                     } else {
                         let length = db.file_text(file_id).text(db).lines().count();
-                        let item_stats = db
-                            .file_item_tree(
-                                EditionedFileId::current_edition(db, file_id).into(),
-                                krate.into(),
-                            )
-                            .item_tree_stats()
-                            .into();
+                        let item_stats = hir::db::file_item_tree(
+                            db,
+                            EditionedFileId::current_edition(db, file_id).into(),
+                            krate.into(),
+                        )
+                        .item_tree_stats()
+                        .into();
 
                         dep_loc += length;
                         dep_item_trees += 1;
@@ -414,7 +416,7 @@ impl flags::AnalysisStats {
                 hir_def::AdtId::from(a),
                 GenericArgs::empty(interner).store(),
                 hir_ty::ParamEnvAndCrate {
-                    param_env: db.trait_environment(GenericDefId::from(a).into()),
+                    param_env: db.trait_environment(a.into()),
                     krate: a.krate(db).into(),
                 }
                 .store(),
@@ -588,8 +590,8 @@ impl flags::AnalysisStats {
                     continue;
                 };
 
-                fn trim(s: &str) -> String {
-                    s.chars().filter(|c| !c.is_whitespace()).collect()
+                fn drop_whitespace(s: &str) -> String {
+                    s.chars().filter(|c| !parser::is_rust_whitespace(*c)).collect()
                 }
 
                 let todo = syntax::ast::make::ext::expr_todo().to_string();
@@ -609,7 +611,8 @@ impl flags::AnalysisStats {
                             display_target,
                         )
                         .unwrap();
-                    syntax_hit_found |= trim(&original_text) == trim(&generated);
+                    syntax_hit_found |=
+                        drop_whitespace(&original_text) == drop_whitespace(&generated);
 
                     // Validate if type-checks
                     let mut txt = file_txt.text(db).to_string();
@@ -663,7 +666,7 @@ impl flags::AnalysisStats {
                 let msg = move || {
                     format!(
                         "processing: {:<50}",
-                        trim(&original_text).chars().take(50).collect::<String>()
+                        drop_whitespace(&original_text).chars().take(50).collect::<String>()
                     )
                 };
                 if verbosity.is_spammy() {
@@ -744,10 +747,8 @@ impl flags::AnalysisStats {
             }
 
             all += 1;
-            let Ok(body_id) = body.try_into() else {
-                continue;
-            };
-            let Err(e) = db.mir_body(body_id) else {
+            #[expect(deprecated)]
+            let Err(e) = body.run_mir_body(db) else {
                 continue;
             };
             if verbosity.is_spammy() {
@@ -778,7 +779,7 @@ impl flags::AnalysisStats {
         vfs: &Vfs,
         bodies: &[DefWithBody],
         signatures: &[GenericDef],
-        variants: &[Variant],
+        _variants: &[Variant],
         verbosity: Verbosity,
     ) {
         let mut bar = match verbosity {
@@ -799,23 +800,24 @@ impl flags::AnalysisStats {
                     InferenceResult::of(snap, body);
                 })
                 .count();
-            let signatures = signatures
+            let _signatures = signatures
                 .iter()
                 .filter_map(|&signatures| signatures.try_into().ok())
                 .collect::<Vec<GenericDefId>>();
-            signatures
-                .par_iter()
-                .map_with(db.clone(), |snap, &signatures| {
-                    InferenceResult::of(snap, signatures);
-                })
-                .count();
-            let variants = variants.iter().copied().map(Into::into).collect::<Vec<VariantId>>();
-            variants
-                .par_iter()
-                .map_with(db.clone(), |snap, &variants| {
-                    InferenceResult::of(snap, variants);
-                })
-                .count();
+            // FIXME: We don't have access to the necessary types here (nor we should have).
+            // signatures
+            //     .par_iter()
+            //     .map_with(db.clone(), |snap, &signatures| {
+            //         InferenceResult::of(snap, signatures);
+            //     })
+            //     .count();
+            // let variants = variants.iter().copied().map(Into::into).collect::<Vec<VariantId>>();
+            // variants
+            //     .par_iter()
+            //     .map_with(db.clone(), |snap, &variants| {
+            //         InferenceResult::of(snap, variants);
+            //     })
+            //     .count();
             eprintln!("{:<20} {}", "Parallel Inference:", inference_sw.elapsed());
         }
 
@@ -907,6 +909,18 @@ impl flags::AnalysisStats {
             // region:expressions
             let (previous_exprs, previous_unknown, previous_partially_unknown) =
                 (num_exprs, num_exprs_unknown, num_exprs_partially_unknown);
+            let type_mismatch_for_node = LazyCell::new(|| {
+                inference_result
+                    .diagnostics()
+                    .iter()
+                    .filter_map(|diag| match diag {
+                        hir_ty::InferenceDiagnostic::TypeMismatch { node, expected, found } => {
+                            Some((*node, (expected.as_ref(), found.as_ref())))
+                        }
+                        _ => None,
+                    })
+                    .collect::<FxHashMap<_, _>>()
+            });
             for (expr_id, _) in body.exprs() {
                 let ty = inference_result.expr_ty(expr_id);
                 num_exprs += 1;
@@ -963,9 +977,10 @@ impl flags::AnalysisStats {
                         ty.display(db, display_target)
                     );
                 }
-                if let Some(mismatch) = inference_result.type_mismatch_for_expr(expr_id) {
+                if inference_result.expr_has_type_mismatch(expr_id) {
                     num_expr_type_mismatches += 1;
                     if verbosity.is_verbose() {
+                        let (expected, actual) = type_mismatch_for_node[&expr_id.into()];
                         if let Some((path, start, end)) = expr_syntax_range(db, vfs, sm(), expr_id)
                         {
                             bar.println(format!(
@@ -975,24 +990,25 @@ impl flags::AnalysisStats {
                                 start.col,
                                 end.line + 1,
                                 end.col,
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
                                 name.display(db, Edition::LATEST),
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         }
                     }
                     if self.output == Some(OutputFormat::Csv) {
+                        let (expected, actual) = type_mismatch_for_node[&expr_id.into()];
                         println!(
                             r#"{},mismatch,"{}","{}""#,
                             location_csv_expr(db, vfs, sm(), expr_id),
-                            mismatch.expected.as_ref().display(db, display_target),
-                            mismatch.actual.as_ref().display(db, display_target)
+                            expected.display(db, display_target),
+                            actual.display(db, display_target)
                         );
                     }
                 }
@@ -1066,9 +1082,10 @@ impl flags::AnalysisStats {
                         ty.display(db, display_target)
                     );
                 }
-                if let Some(mismatch) = inference_result.type_mismatch_for_pat(pat_id) {
+                if inference_result.pat_has_type_mismatch(pat_id) {
                     num_pat_type_mismatches += 1;
                     if verbosity.is_verbose() {
+                        let (expected, actual) = type_mismatch_for_node[&pat_id.into()];
                         if let Some((path, start, end)) = pat_syntax_range(db, vfs, sm(), pat_id) {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Expected {}, got {}",
@@ -1077,24 +1094,25 @@ impl flags::AnalysisStats {
                                 start.col,
                                 end.line + 1,
                                 end.col,
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
                                 name.display(db, Edition::LATEST),
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         }
                     }
                     if self.output == Some(OutputFormat::Csv) {
+                        let (expected, actual) = type_mismatch_for_node[&pat_id.into()];
                         println!(
                             r#"{},mismatch,"{}","{}""#,
                             location_csv_pat(db, vfs, sm(), pat_id),
-                            mismatch.expected.as_ref().display(db, display_target),
-                            mismatch.actual.as_ref().display(db, display_target)
+                            expected.display(db, display_target),
+                            actual.display(db, display_target)
                         );
                     }
                 }
@@ -1484,7 +1502,7 @@ fn location_csv_expr(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, expr_id: 
         Ok(s) => s,
         Err(SyntheticSyntax) => return "synthetic,,".to_owned(),
     };
-    let root = db.parse_or_expand(src.file_id);
+    let root = src.file_id.parse_or_expand(db);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
     let path = vfs.file_path(original_range.file_id.file_id(db));
@@ -1500,7 +1518,7 @@ fn location_csv_pat(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, pat_id: Pa
         Ok(s) => s,
         Err(SyntheticSyntax) => return "synthetic,,".to_owned(),
     };
-    let root = db.parse_or_expand(src.file_id);
+    let root = src.file_id.parse_or_expand(db);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
     let path = vfs.file_path(original_range.file_id.file_id(db));
@@ -1519,7 +1537,7 @@ fn expr_syntax_range<'a>(
 ) -> Option<(&'a VfsPath, LineCol, LineCol)> {
     let src = sm.expr_syntax(expr_id);
     if let Ok(src) = src {
-        let root = db.parse_or_expand(src.file_id);
+        let root = src.file_id.parse_or_expand(db);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
         let path = vfs.file_path(original_range.file_id.file_id(db));
@@ -1540,7 +1558,7 @@ fn pat_syntax_range<'a>(
 ) -> Option<(&'a VfsPath, LineCol, LineCol)> {
     let src = sm.pat_syntax(pat_id);
     if let Ok(src) = src {
-        let root = db.parse_or_expand(src.file_id);
+        let root = src.file_id.parse_or_expand(db);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
         let path = vfs.file_path(original_range.file_id.file_id(db));
@@ -1647,5 +1665,5 @@ impl fmt::Display for PrettyItemStats {
 // fn syntax_len(node: SyntaxNode) -> usize {
 //     // Macro expanded code doesn't contain whitespace, so erase *all* whitespace
 //     // to make macro and non-macro code comparable.
-//     node.to_string().replace(|it: char| it.is_ascii_whitespace(), "").len()
+//     drop_whitespace(&node.to_string()).len()
 // }

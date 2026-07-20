@@ -1,9 +1,12 @@
+use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
+use stdarch_gen_common::{Mode, run_generator};
 
 /// Complete lines of generated source.
 ///
@@ -90,6 +93,14 @@ impl TargetFeature {
     }
 }
 
+fn portable_intrinsics() -> HashSet<&'static str> {
+    include_str!("portable-intrinsics.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
 fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     let f = File::open(in_file.clone()).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
     let f = BufReader::new(f);
@@ -105,6 +116,7 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     let mut asm_fmts = String::new();
     let mut data_types = String::new();
     let fn_pat = format!("__{ext_name}_");
+    let portable_intrinsics = portable_intrinsics();
     for line in f.lines() {
         let line = line.unwrap();
         if line.is_empty() {
@@ -121,6 +133,9 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
             let e = line.find('(').unwrap();
             let name = line.get(s + 2..e).unwrap().trim().to_string();
             out.push_str(&format!("/// {name}\n"));
+            if portable_intrinsics.contains(name.as_str()) {
+                out.push_str("impl = portable\n");
+            }
             out.push_str(&format!("name = {name}\n"));
             out.push_str(&format!("asm-fmts = {asm_fmts}\n"));
             out.push_str(&format!("data-types = {data_types}\n"));
@@ -135,8 +150,8 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
-    let f = File::open(in_file.clone()).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
+fn gen_bind(in_file: &str, ext_name: &str, out_path: &Path) -> io::Result<()> {
+    let f = File::open(in_file).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
     let f = BufReader::new(f);
 
     let target: TargetFeature = TargetFeature::new(ext_name);
@@ -146,6 +161,7 @@ fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
     let mut link_function_str = String::new();
     let mut function_str = String::new();
     let mut out = String::new();
+    let mut skip = false;
 
     out.push_str(&format!(
         r#"// This code is automatically generated. DO NOT MODIFY.
@@ -173,7 +189,9 @@ unsafe extern "unadjusted" {
         if line.is_empty() {
             continue;
         }
-        if let Some(name) = line.strip_prefix("name = ") {
+        if line.starts_with("impl = portable") {
+            skip = true;
+        } else if let Some(name) = line.strip_prefix("name = ") {
             current_name = Some(String::from(name));
         } else if line.starts_with("asm-fmts = ") {
             asm_fmts = line[10..]
@@ -210,6 +228,11 @@ unsafe extern "unadjusted" {
                 panic!("DEBUG: line: {0} len: {1}", line, data_types.len());
             }
 
+            if skip {
+                skip = false;
+                continue;
+            }
+
             let (link_function, function) =
                 gen_bind_body(&current_name, &asm_fmts, &in_t, out_t, para_num, target);
             link_function_str.push_str(&link_function);
@@ -220,13 +243,7 @@ unsafe extern "unadjusted" {
     out.push_str("}\n");
     out.push_str(&function_str);
 
-    let out_path: PathBuf =
-        PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
-            .join("src")
-            .join("loongarch64")
-            .join(ext_name);
-    std::fs::create_dir_all(&out_path)?;
-
+    std::fs::create_dir_all(out_path)?;
     let mut file = File::create(out_path.join("generated.rs"))?;
     file.write_all(out.as_bytes())?;
     Ok(())
@@ -597,7 +614,7 @@ fn gen_bind_body(
     let function = if !rustc_legacy_const_generics.is_empty() {
         format!(
             r#"
-#[inline(always)]{target_feature}
+#[inline]{target_feature}
 #[{rustc_legacy_const_generics}]
 #[unstable(feature = "stdarch_loongarch", issue = "117427")]
 {fn_decl}{{
@@ -609,7 +626,7 @@ fn gen_bind_body(
     } else {
         format!(
             r#"
-#[inline(always)]{target_feature}
+#[inline]{target_feature}
 #[unstable(feature = "stdarch_loongarch", issue = "117427")]
 {fn_decl}{{
     {call_params}
@@ -841,7 +858,7 @@ union v4df
     out.push('\n');
     out.push_str("int main(int argc, char *argv[])\n");
     out.push_str("{\n");
-    out.push_str("    printf(\"// This code is automatically generated. DO NOT MODIFY.\\n\");\n");
+    out.push_str("    printf(\"// Auto-generated tests. DO NOT MODIFY.\\n\");\n");
     out.push_str("    printf(\"// See crates/stdarch-gen-loongarch/README.md\\n\\n\");\n");
     out.push_str("    printf(\"use crate::{\\n\");\n");
     out.push_str("    printf(\"    core_arch::{loongarch64::*, simd::*},\\n\");\n");
@@ -1583,28 +1600,53 @@ static void {current_name}(void)
     (impl_function, call_function)
 }
 
-pub fn main() -> io::Result<()> {
+/// Runs the check/bless harness for `lsx`/`lasx` when invoked with
+/// no args or a bare ext name.
+pub fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
-    let in_file = args.get(1).cloned().expect("Input file missing!");
-    let in_file_path = PathBuf::from(&in_file);
-    let in_file_name = in_file_path
+    let arg_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let harness_exts: Option<&[&str]> = match arg_strs.as_slice() {
+        [_] => Some(&["lsx", "lasx"]),
+        [_, "lsx"] => Some(&["lsx"]),
+        [_, "lasx"] => Some(&["lasx"]),
+        _ => None,
+    };
+    if let Some(exts) = harness_exts {
+        let crate_dir =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+        let core_arch_src = crate_dir.join("../core_arch/src");
+        let mode = Mode::from_env();
+        for ext in exts {
+            let spec_rel = format!("crates/stdarch-gen-loongarch/{ext}.spec");
+            let committed = core_arch_src.join("loongarch64").join(ext);
+            run_generator(&committed, mode, |out_dir| {
+                gen_bind(&spec_rel, ext, out_dir)
+            })
+            .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
+    let in_file = args[1].clone();
+    let in_file_name = PathBuf::from(&in_file)
         .file_name()
         .unwrap()
-        .to_os_string()
-        .into_string()
-        .unwrap();
-
+        .to_string_lossy()
+        .into_owned();
     let ext_name = if in_file_name.starts_with("lasx") {
         "lasx"
     } else {
         "lsx"
     };
-
     if in_file_name.ends_with(".h") {
-        gen_spec(in_file, ext_name)
-    } else if args.get(2).is_some() {
-        gen_test(in_file, ext_name)
-    } else {
-        gen_bind(in_file, ext_name)
+        return gen_spec(in_file, ext_name).map_err(|e| e.to_string());
     }
+    if let [_, _lsx_or_lasx, "test"] = arg_strs.as_slice() {
+        return gen_test(in_file, ext_name).map_err(|e| e.to_string());
+    }
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
+        .join("src")
+        .join("loongarch64")
+        .join(ext_name);
+    gen_bind(&in_file, ext_name, &out_path).map_err(|e| e.to_string())
 }

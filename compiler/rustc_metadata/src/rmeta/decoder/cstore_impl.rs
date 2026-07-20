@@ -14,11 +14,12 @@ use rustc_middle::middle::stability::DeprecationEntry;
 use rustc_middle::queries::ExternProviders;
 use rustc_middle::query::LocalCrate;
 use rustc_middle::ty::fast_reject::SimplifiedType;
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
 use rustc_middle::util::Providers;
 use rustc_serialize::Decoder;
 use rustc_session::StableCrateId;
 use rustc_session::cstore::{CrateStore, ExternCrate};
+use rustc_span::def_id::ModId;
 use rustc_span::hygiene::ExpnId;
 use rustc_span::{Span, Symbol, kw};
 
@@ -39,10 +40,11 @@ impl<T> ProcessQueryValue<'_, T> for T {
     }
 }
 
-impl<'tcx, T> ProcessQueryValue<'tcx, ty::EarlyBinder<'tcx, T>> for T {
+// The `TypeVisitable` bound here is merely for `EarlyBinder`'s rigidness check.
+impl<'tcx, T: TypeVisitable<TyCtxt<'tcx>>> ProcessQueryValue<'tcx, ty::EarlyBinder<'tcx, T>> for T {
     #[inline(always)]
     fn process_decoded(self, _tcx: TyCtxt<'_>, _err: impl Fn() -> !) -> ty::EarlyBinder<'tcx, T> {
-        ty::EarlyBinder::bind(self)
+        ty::EarlyBinder::bind_no_rigid_aliases(self)
     }
 }
 
@@ -190,6 +192,13 @@ impl IntoArgs for DefId {
     }
 }
 
+impl IntoArgs for ModId {
+    type Other = ();
+    fn into_args(self) -> (DefId, ()) {
+        (self.to_def_id(), ())
+    }
+}
+
 impl IntoArgs for CrateNum {
     type Other = ();
     fn into_args(self) -> (DefId, ()) {
@@ -227,7 +236,7 @@ provide! { tcx, def_id, other, cdata,
     explicit_super_predicates_of => { table_defaulted_array }
     explicit_implied_predicates_of => { table_defaulted_array }
     type_of => { table }
-    type_alias_is_lazy => { table_direct }
+    type_alias_is_checked => { table_direct }
     variances_of => { table }
     fn_sig => { table }
     codegen_fn_attrs => { table }
@@ -261,7 +270,8 @@ provide! { tcx, def_id, other, cdata,
             .coerce_unsized_info
             .get(cdata, def_id.index)
             .map(|lazy| lazy.decode((cdata, tcx)))
-            .process_decoded(tcx, || panic!("{def_id:?} does not have coerce_unsized_info"))) }
+            .process_decoded(tcx, || panic!("{def_id:?} does not have coerce_unsized_info")))
+    }
     mir_const_qualif => { table }
     rendered_const => { table }
     rendered_precise_capturing_args => { table }
@@ -300,10 +310,10 @@ provide! { tcx, def_id, other, cdata,
         Ok(cdata
             .root
             .tables
-            .trait_impl_trait_tys
+            .collect_return_position_impl_trait_in_trait_tys
             .get(cdata, def_id.index)
             .map(|lazy| lazy.decode((cdata, tcx)))
-            .process_decoded(tcx, || panic!("{def_id:?} does not have trait_impl_trait_tys")))
+            .process_decoded(tcx, || panic!("{def_id:?} does not have collect_return_position_impl_trait_in_trait_tys")))
     }
 
     associated_types_for_impl_traits_in_trait_or_impl => { table }
@@ -415,6 +425,7 @@ provide! { tcx, def_id, other, cdata,
     }
     anon_const_kind => { table }
     const_of_item => { table }
+    args_known_to_outlive_alias_params => { table }
 }
 
 pub(in crate::rmeta) fn provide(providers: &mut Providers) {
@@ -554,15 +565,15 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
             )
         },
         crates: |tcx, ()| {
-            // The list of loaded crates is now frozen in query cache,
-            // so make sure cstore is not mutably accessed from here on.
-            tcx.untracked().cstore.freeze();
+            // The loaded-crate list is now frozen in the query cache; stop
+            // mutating the cstore and stable crate id map from here on.
+            tcx.untracked().freeze_cstore();
             tcx.arena.alloc_from_iter(CStore::from_tcx(tcx).iter_crate_data().map(|(cnum, _)| cnum))
         },
         used_crates: |tcx, ()| {
-            // The list of loaded crates is now frozen in query cache,
-            // so make sure cstore is not mutably accessed from here on.
-            tcx.untracked().cstore.freeze();
+            // The loaded-crate list is now frozen in the query cache; stop
+            // mutating the cstore and stable crate id map from here on.
+            tcx.untracked().freeze_cstore();
             tcx.arena.alloc_from_iter(
                 CStore::from_tcx(tcx)
                     .iter_crate_data()
@@ -695,6 +706,7 @@ impl CrateStore for CStore {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
     fn untracked_as_any(&mut self) -> &mut dyn Any {
         self
     }

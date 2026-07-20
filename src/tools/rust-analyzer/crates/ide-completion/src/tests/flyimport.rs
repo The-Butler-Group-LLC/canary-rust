@@ -1280,10 +1280,10 @@ fn no_inherent_candidates_proposed() {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1299,10 +1299,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1318,10 +1318,10 @@ mod bar {
     check(
         r#"
 mod baz {
-    pub trait DefDatabase {
+    pub trait SourceDatabase {
         fn method1(&self);
     }
-    pub trait HirDatabase: DefDatabase {
+    pub trait HirDatabase: SourceDatabase {
         fn method2(&self);
     }
 }
@@ -1772,7 +1772,7 @@ fn function() {
 "#,
         expect![[r#"
             st FooStruct (use outer::FooStruct) BarStruct
-            md foo (use outer::foo)
+            md foo:: (use outer::foo)
             fn foo_fun() (use outer::foo_fun)        fn()
         "#]],
     );
@@ -1809,9 +1809,8 @@ fn intrinsics() {
         r#"
     //- /core.rs crate:core
     pub mod intrinsics {
-        extern "rust-intrinsic" {
-            pub fn transmute<Src, Dst>(src: Src) -> Dst;
-        }
+        #[rustc_intrinsic]
+        pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
     }
     pub mod mem {
         pub use crate::intrinsics::transmute;
@@ -1829,9 +1828,8 @@ fn intrinsics() {
         r#"
 //- /core.rs crate:core
 pub mod intrinsics {
-    extern "rust-intrinsic" {
-        pub fn transmute<Src, Dst>(src: Src) -> Dst;
-    }
+    #[rustc_intrinsic]
+    pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
 }
 pub mod mem {
     pub use crate::intrinsics::transmute;

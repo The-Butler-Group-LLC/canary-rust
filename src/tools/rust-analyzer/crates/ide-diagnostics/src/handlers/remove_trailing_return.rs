@@ -1,4 +1,4 @@
-use hir::{FileRange, db::ExpandDatabase, diagnostics::RemoveTrailingReturn};
+use hir::{FileRange, diagnostics::RemoveTrailingReturn};
 use ide_db::text_edit::TextEdit;
 use ide_db::{assists::Assist, source_change::SourceChange};
 use syntax::{AstNode, ast};
@@ -10,7 +10,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_display_ran
 // This diagnostic is triggered when there is a redundant `return` at the end of a function
 // or closure.
 pub(crate) fn remove_trailing_return(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &RemoveTrailingReturn,
 ) -> Option<Diagnostic> {
     if d.return_expr.file_id.macro_file().is_some() {
@@ -36,8 +36,8 @@ pub(crate) fn remove_trailing_return(
     )
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &RemoveTrailingReturn) -> Option<Vec<Assist>> {
-    let root = ctx.sema.db.parse_or_expand(d.return_expr.file_id);
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &RemoveTrailingReturn) -> Option<Vec<Assist>> {
+    let root = d.return_expr.file_id.parse_or_expand(ctx.sema.db);
     let return_expr = d.return_expr.value.to_node(&root);
     let stmt = return_expr.syntax().parent().and_then(ast::ExprStmt::cast);
 
@@ -333,7 +333,7 @@ fn foo(x: usize) -> u8 {
     }
 }
 "#,
-            std::iter::once("remove-unnecessary-else".to_owned()),
+            &["remove-unnecessary-else"],
         );
         check_fix(
             r#"

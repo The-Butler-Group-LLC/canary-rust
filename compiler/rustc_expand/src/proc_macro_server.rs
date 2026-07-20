@@ -15,6 +15,7 @@ use rustc_proc_macro::bridge::{
     DelimSpan, Diagnostic, ExpnGlobals, Group, Ident, LitKind, Literal, Punct, TokenTree, server,
 };
 use rustc_proc_macro::{Delimiter, Level};
+use rustc_session::Session;
 use rustc_session::parse::ParseSess;
 use rustc_span::def_id::CrateNum;
 use rustc_span::{BytePos, FileName, Pos, Span, Symbol, sym};
@@ -440,6 +441,10 @@ impl<'a, 'b> Rustc<'a, 'b> {
         }
     }
 
+    fn sess(&self) -> &Session {
+        &self.ecx.sess
+    }
+
     fn psess(&self) -> &ParseSess {
         self.ecx.psess()
     }
@@ -485,9 +490,11 @@ impl server::Server for Rustc<'_, '_> {
     fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span, Self::Symbol>, String> {
         let name = FileName::proc_macro_source_code(s);
 
-        let mut parser =
+        let mut parser = rustc_errors::catch_fatal_errors(|| {
             new_parser_from_source_str(self.psess(), name, s.to_owned(), StripTokens::Nothing)
-                .map_err(cancel_diags_into_string)?;
+        })
+        .map_err(|_| String::from("failed to parse to literal"))?
+        .map_err(cancel_diags_into_string)?;
 
         let first_span = parser.token.span.data();
         let minus_present = parser.eat(exp!(Minus));
@@ -564,12 +571,15 @@ impl server::Server for Rustc<'_, '_> {
     }
 
     fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
-        source_str_to_stream(
-            self.psess(),
-            FileName::proc_macro_source_code(src),
-            src.to_string(),
-            Some(self.call_site),
-        )
+        rustc_errors::catch_fatal_errors(|| {
+            source_str_to_stream(
+                self.psess(),
+                FileName::proc_macro_source_code(src),
+                src.to_string(),
+                Some(self.call_site),
+            )
+        })
+        .map_err(|_| String::from("failed to parse to tokenstream"))?
         .map_err(cancel_diags_into_string)
     }
 
@@ -825,7 +835,7 @@ impl server::Server for Rustc<'_, '_> {
     /// since we've loaded `my_proc_macro` from disk in order to execute it).
     /// In this way, we have obtained a span pointing into `my_proc_macro`
     fn span_save_span(&mut self, span: Self::Span) -> usize {
-        self.psess().save_proc_macro_span(span)
+        self.sess().save_proc_macro_span(span)
     }
 
     fn span_recover_proc_macro_span(&mut self, id: usize) -> Self::Span {

@@ -1,8 +1,8 @@
 //! Compiled declarative macro expanders (`macro_rules!` and `macro`)
 
-use std::{cell::OnceCell, ops::ControlFlow};
+use std::ops::ControlFlow;
 
-use base_db::Crate;
+use base_db::{Crate, SourceDatabase};
 use span::{Edition, Span, SyntaxContext};
 use stdx::TupleExt;
 use syntax::{
@@ -10,13 +10,11 @@ use syntax::{
     ast::{self, HasAttrs},
 };
 use syntax_bridge::DocCommentDesugarMode;
-use triomphe::Arc;
 
 use crate::{
     AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, Lookup, MacroCallId,
     MacroCallStyle,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
-    db::ExpandDatabase,
     hygiene::{Transparency, apply_mark},
     tt,
 };
@@ -32,12 +30,12 @@ pub struct DeclarativeMacroExpander {
 impl DeclarativeMacroExpander {
     pub fn expand(
         &self,
-        db: &dyn ExpandDatabase,
-        tt: tt::TopSubtree,
+        db: &dyn SourceDatabase,
+        tt: &tt::TopSubtree,
         call_id: MacroCallId,
         span: Span,
     ) -> ExpandResult<(tt::TopSubtree, Option<u32>)> {
-        let loc = db.lookup_intern_macro_call(call_id);
+        let loc = call_id.loc(db);
         match self.mac.err() {
             Some(_) => ExpandResult::new(
                 (tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }), None),
@@ -47,7 +45,7 @@ impl DeclarativeMacroExpander {
                 .mac
                 .expand(
                     db,
-                    &tt,
+                    tt,
                     |s| {
                         s.ctx =
                             apply_mark(db, s.ctx, call_id.into(), self.transparency, self.edition)
@@ -61,8 +59,8 @@ impl DeclarativeMacroExpander {
 
     pub fn expand_unhygienic(
         &self,
-        db: &dyn ExpandDatabase,
-        tt: tt::TopSubtree,
+        db: &dyn SourceDatabase,
+        tt: &tt::TopSubtree,
         call_style: MacroCallStyle,
         call_site: Span,
     ) -> ExpandResult<tt::TopSubtree> {
@@ -73,25 +71,32 @@ impl DeclarativeMacroExpander {
             ),
             None => self
                 .mac
-                .expand(db, &tt, |_| (), call_style, call_site)
+                .expand(db, tt, |_| (), call_style, call_site)
                 .map(TupleExt::head)
                 .map_err(Into::into),
         }
     }
+}
 
-    pub(crate) fn expander(
-        db: &dyn ExpandDatabase,
+#[salsa::tracked]
+impl AstId<ast::Macro> {
+    /// Fetches (and compiles) the expander of this decl macro.
+    #[salsa::tracked(returns(ref))]
+    pub fn decl_macro_expander(
+        self,
+        db: &dyn SourceDatabase,
         def_crate: Crate,
-        id: AstId<ast::Macro>,
-    ) -> Arc<DeclarativeMacroExpander> {
-        let (root, map) = crate::db::parse_with_map(db, id.file_id);
+    ) -> DeclarativeMacroExpander {
+        let id = self;
+        let (root, map) = id.file_id.parse_with_map(db);
+
         let root = root.syntax_node();
 
         let transparency = |node: ast::AnyHasAttrs| {
-            let cfg_options = OnceCell::new();
+            let mut cfg_options = None;
             expand_cfg_attr(
                 node.attrs(),
-                || cfg_options.get_or_init(|| def_crate.cfg_options(db)),
+                || cfg_options.get_or_insert_with(|| def_crate.cfg_options(db)),
                 |attr, _| {
                     if let ast::Meta::KeyValueMeta(attr) = attr
                         && attr.path().is1("rustc_macro_transparency")
@@ -117,8 +122,7 @@ impl DeclarativeMacroExpander {
                 def_crate.data(db).edition
             } else {
                 // UNWRAP-SAFETY: Only the root context has no outer expansion
-                let krate =
-                    db.lookup_intern_macro_call(ctx.outer_expn(db).unwrap().into()).def.krate;
+                let krate = crate::MacroCallId::from(ctx.outer_expn(db).unwrap()).loc(db).def.krate;
                 krate.data(db).edition
             }
         };
@@ -128,7 +132,7 @@ impl DeclarativeMacroExpander {
                     Some(arg) => {
                         let tt = syntax_bridge::syntax_node_to_token_tree(
                             arg.syntax(),
-                            map.as_ref(),
+                            map,
                             map.span_for_range(
                                 macro_rules.macro_rules_token().unwrap().text_range(),
                             ),
@@ -152,14 +156,14 @@ impl DeclarativeMacroExpander {
                         let args = macro_def.args().map(|args| {
                             syntax_bridge::syntax_node_to_token_tree(
                                 args.syntax(),
-                                map.as_ref(),
+                                map,
                                 span,
                                 DocCommentDesugarMode::Mbe,
                             )
                         });
                         let body = syntax_bridge::syntax_node_to_token_tree(
                             body.syntax(),
-                            map.as_ref(),
+                            map,
                             span,
                             DocCommentDesugarMode::Mbe,
                         );
@@ -177,6 +181,6 @@ impl DeclarativeMacroExpander {
             HirFileId::MacroFile(macro_file) => macro_file.lookup(db).ctxt,
             HirFileId::FileId(file) => SyntaxContext::root(file.edition(db)),
         });
-        Arc::new(DeclarativeMacroExpander { mac, transparency, edition })
+        DeclarativeMacroExpander { mac, transparency, edition }
     }
 }

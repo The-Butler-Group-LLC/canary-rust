@@ -1,4 +1,3 @@
-use hir::db::ExpandDatabase;
 use hir::{ExpandResult, InFile, Semantics};
 use ide_db::{
     FileId, RootDatabase, base_db::Crate, helpers::pick_best_token,
@@ -6,7 +5,8 @@ use ide_db::{
 };
 use span::{SpanMap, TextRange, TextSize};
 use stdx::format_to;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, ast, ted};
+use syntax::syntax_editor::SyntaxEditor;
+use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, ast};
 
 use crate::FilePosition;
 
@@ -66,13 +66,13 @@ pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<
             .count();
         let ExpandResult { err, value: expansion } = expansions.get(idx)?.clone()?;
         let expansion_file_id = sema.hir_file_for(&expansion).macro_file()?;
-        let expansion_span_map = db.expansion_span_map(expansion_file_id);
+        let expansion_span_map = expansion_file_id.expansion_span_map(db);
         let mut expansion = format(
             db,
             SyntaxKind::MACRO_ITEMS,
             position.file_id,
             expansion,
-            &expansion_span_map,
+            expansion_span_map,
             krate,
         );
         if let Some(err) = err {
@@ -153,17 +153,16 @@ fn expand_macro_recur(
             .or_else(|| sema.expand_allowed_builtins(macro_call))?,
         item => sema.expand_attr_macro(item)?.map(|it| it.value),
     };
-    let expanded = expanded.clone_for_update();
     if let Some(err) = err {
         format_to!(error, "\n{}", err.render_to_string(sema.db));
     }
     let file_id =
         sema.hir_file_for(&expanded).macro_file().expect("expansion must produce a macro file");
-    let expansion_span_map = sema.db.expansion_span_map(file_id);
+    let expansion_span_map = file_id.expansion_span_map(sema.db);
     result_span_map.merge(
         TextRange::at(offset_in_original_node, macro_call.syntax().text_range().len()),
         expanded.text_range().len(),
-        &expansion_span_map,
+        expansion_span_map,
     );
     Some(expand(sema, expanded, error, result_span_map, u32::from(offset_in_original_node) as i32))
 }
@@ -175,6 +174,7 @@ fn expand(
     result_span_map: &mut SpanMap,
     mut offset_in_original_node: i32,
 ) -> SyntaxNode {
+    let (editor, expanded) = SyntaxEditor::new(expanded);
     let children = expanded.descendants().filter_map(ast::Item::cast);
     let mut replacements = Vec::new();
 
@@ -200,8 +200,8 @@ fn expand(
         }
     }
 
-    replacements.into_iter().rev().for_each(|(old, new)| ted::replace(old.syntax(), new));
-    expanded
+    replacements.into_iter().rev().for_each(|(old, new)| editor.replace(old.syntax(), new));
+    editor.finish().new_root().clone()
 }
 
 fn format(
@@ -357,7 +357,7 @@ fn main() {
 "#,
             expect![[r#"
                 bar!
-                for _ in 0..42{}"#]],
+                for _ in 0..42 {}"#]],
         );
     }
 
@@ -433,9 +433,9 @@ fn main() {
             expect![[r#"
                 match_ast!
                 {
-                    if let Some(it) = ast::TraitDef::cast(container.clone()){}
-                    else if let Some(it) = ast::ImplDef::cast(container.clone()){}
-                    else {
+                    if let Some(it) = ast::TraitDef::cast(container.clone()){
+                    }else if let Some(it) = ast::ImplDef::cast(container.clone()){
+                    }else {
                         {
                             continue
                         }
@@ -448,6 +448,7 @@ fn main() {
     fn macro_expand_match_ast_inside_let_statement() {
         check(
             r#"
+//- minicore: try
 macro_rules! match_ast {
     (match $node:ident { $($tt:tt)* }) => { match_ast!(match ($node) { $($tt)* }) };
     (match ($node:expr) {}) => {{}};
@@ -593,7 +594,7 @@ struct Foo {}
 "#,
             expect![[r#"
                 proc_macros::DeriveIdentity
-                struct Foo{}"#]],
+                struct Foo {}"#]],
         );
     }
 
@@ -611,7 +612,7 @@ struct Foo {}
             expect![[r#"
                 proc_macros::DeriveIdentity
                 #[derive(proc_macros::DeriveIdentity)]
-                struct Foo{}"#]],
+                struct Foo {}"#]],
         );
     }
 
@@ -627,7 +628,7 @@ struct Foo {}
 "#,
             expect![[r#"
                 proc_macros::DeriveIdentity
-                struct Foo{}"#]],
+                struct Foo {}"#]],
         );
         check(
             r#"
@@ -639,7 +640,7 @@ struct Foo {}
 "#,
             expect![[r#"
                 proc_macros::DeriveIdentity
-                struct Foo{}"#]],
+                struct Foo {}"#]],
         );
     }
 
@@ -782,7 +783,6 @@ foo();
                 macro_rules! foo {
                     () => {
                         fn item(){}
-
                     };
                 }
                 foo();"#]],

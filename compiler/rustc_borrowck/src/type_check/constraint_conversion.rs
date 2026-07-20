@@ -1,17 +1,17 @@
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_infer::infer::SubregionOrigin;
-use rustc_infer::infer::canonical::QueryRegionConstraints;
+use rustc_infer::infer::canonical::{QueryRegionConstraint, QueryRegionConstraints};
 use rustc_infer::infer::outlives::env::RegionBoundPairs;
 use rustc_infer::infer::outlives::obligations::{TypeOutlives, TypeOutlivesDelegate};
 use rustc_infer::infer::region_constraints::{GenericKind, VerifyBound};
-use rustc_infer::traits::query::type_op::DeeplyNormalize;
+use rustc_infer::traits::query::type_op::Normalize;
 use rustc_middle::bug;
 use rustc_middle::ty::{
     self, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, elaborate, fold_regions,
 };
 use rustc_span::Span;
-use rustc_trait_selection::traits::query::type_op::{TypeOp, TypeOpOutput};
+use rustc_trait_selection::traits::query::type_op::TypeOpOutput;
 use tracing::{debug, instrument};
 
 use crate::constraints::OutlivesConstraint;
@@ -74,9 +74,9 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         let assumptions =
             elaborate::elaborate_outlives_assumptions(self.infcx.tcx, assumptions.iter().copied());
 
-        for &(constraint, constraint_category) in constraints {
+        for &QueryRegionConstraint { constraint, category, .. } in constraints {
             constraint.iter_outlives().for_each(|predicate| {
-                self.convert(predicate, constraint_category, &assumptions);
+                self.convert(predicate, category, &assumptions);
             });
         }
     }
@@ -183,7 +183,7 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
                         // in the new trait solver.
                         if infcx.next_trait_solver() {
                             t1 = self.normalize_and_add_type_outlives_constraints(
-                                t1,
+                                ty::Unnormalized::new_wip(t1),
                                 &mut next_outlives_predicates,
                             );
                         }
@@ -279,31 +279,29 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         self.constraints.type_tests.push(type_test);
     }
 
+    // FIXME(trait-refactor-initiative#260): This function should be
+    // removed.
     fn normalize_and_add_type_outlives_constraints(
         &self,
-        ty: Ty<'tcx>,
+        ty: ty::Unnormalized<'tcx, Ty<'tcx>>,
         next_outlives_predicates: &mut Vec<(
             ty::ArgOutlivesPredicate<'tcx>,
             ConstraintCategory<'tcx>,
         )>,
     ) -> Ty<'tcx> {
-        match self.infcx.param_env.and(DeeplyNormalize { value: ty }).fully_perform(
-            self.infcx,
-            self.infcx.root_def_id,
-            self.span,
-        ) {
+        match self.infcx.fully_perform(Normalize { value: ty }, self.span) {
             Ok(TypeOpOutput { output: ty, constraints, .. }) => {
                 // FIXME(higher_ranked_auto): What should we do with the assumptions here?
                 if let Some(QueryRegionConstraints { constraints, assumptions: _ }) = constraints {
                     next_outlives_predicates.extend(constraints.iter().flat_map(
-                        |(constraint, category)| {
+                        |QueryRegionConstraint { constraint, category, .. }| {
                             constraint.iter_outlives().map(|outlives| (outlives, *category))
                         },
                     ));
                 }
                 ty
             }
-            Err(_) => ty,
+            Err(_) => ty.skip_norm_wip(),
         }
     }
 }

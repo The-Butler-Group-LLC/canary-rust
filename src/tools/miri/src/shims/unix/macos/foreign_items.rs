@@ -42,18 +42,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // File related shims
             "close$NOCANCEL" => {
-                let [result] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.close(result)?;
+                let [fd] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let fd = this.read_scalar(fd)?.to_i32()?;
+                let result = this.close(fd)?;
                 this.write_scalar(result, dest)?;
             }
-            "stat" | "stat$INODE64" => {
-                // FIXME: This does not have a direct test (#3179).
+            "stat$INODE64" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "lstat" | "lstat$INODE64" => {
-                // FIXME: This does not have a direct test (#3179).
+            "lstat$INODE64" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
@@ -246,7 +245,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "pthread_threadid_np" => {
                 let [thread, tid_ptr] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let res = this.apple_pthread_threadip_np(thread, tid_ptr)?;
+                let res = this.apple_pthread_threadid_np(thread, tid_ptr)?;
                 this.write_scalar(res, dest)?;
             }
 
@@ -328,6 +327,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.pthread_cond_timedwait(
                     cond, mutex, reltime, dest, /* macos_relative_np */ true,
                 )?;
+            }
+
+            // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
+            // These shims are enabled only when the caller is in the standard library.
+            "confstr" => {
+                let [_key, _buf, _buflen] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                // We just pretend that no configuration key exists, and return EINVAL.
+                this.set_last_error(LibcError("EINVAL"))?;
+                this.write_null(dest)?;
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),

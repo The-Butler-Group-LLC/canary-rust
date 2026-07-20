@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rustc_ast::{LitKind, MetaItemKind, token};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::jobserver::{self, Proxy};
+use rustc_data_structures::jobserver;
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
 use rustc_lint::LintStore;
 use rustc_middle::ty;
@@ -41,9 +41,6 @@ pub struct Compiler {
 
     /// A reference to the current `GlobalCtxt` which we pass on to `GlobalCtxt`.
     pub(crate) current_gcx: CurrentGcx,
-
-    /// A jobserver reference which we pass on to `GlobalCtxt`.
-    pub(crate) jobserver_proxy: Arc<Proxy>,
 }
 
 /// Converts strings provided as `--cfg [cfgspec]` into a `Cfg`.
@@ -369,27 +366,24 @@ pub struct Config {
     pub using_internal_features: &'static std::sync::atomic::AtomicBool,
 }
 
-/// Initialize jobserver before getting `jobserver::client` and `build_session`.
-pub(crate) fn initialize_checked_jobserver(early_dcx: &EarlyDiagCtxt) {
-    jobserver::initialize_checked(|err| {
-        early_dcx
-            .early_struct_warn(err)
-            .with_note("the build environment is likely misconfigured")
-            .emit()
-    });
-}
-
 // JUSTIFICATION: before session exists, only config
 #[allow(rustc::bad_opt_access)]
 pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Send) -> R {
     trace!("run_compiler");
 
     // Set parallel mode before thread pool creation, which will create `Lock`s.
-    rustc_data_structures::sync::set_dyn_thread_safe_mode(config.opts.unstable_opts.threads > 1);
+    rustc_data_structures::sync::set_dyn_thread_safe_mode(
+        config.opts.unstable_opts.threads.is_some(),
+    );
 
-    // Check jobserver before run_in_thread_pool_with_globals, which call jobserver::acquire_thread
+    // Initialize jobserver as early as possible.
     let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
-    initialize_checked_jobserver(&early_dcx);
+    jobserver::initialize_checked(|err| {
+        early_dcx
+            .early_struct_warn(err)
+            .with_note("the build environment is likely misconfigured")
+            .emit()
+    });
 
     crate::callbacks::setup_callbacks();
 
@@ -407,10 +401,10 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     util::run_in_thread_pool_with_globals(
         &early_dcx,
         config.opts.edition,
-        config.opts.unstable_opts.threads,
+        config.opts.unstable_opts.threads.unwrap_or(1),
         &config.extra_symbols,
         SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind },
-        |current_gcx, jobserver_proxy| {
+        |current_gcx| {
             // The previous `early_dcx` can't be reused here because it doesn't
             // impl `Send`. Creating a new one is fine.
             let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
@@ -447,16 +441,17 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             };
             codegen_backend.init(&sess);
             sess.replaced_intrinsics = FxHashSet::from_iter(codegen_backend.replaced_intrinsics());
+            sess.fallback_intrinsics = FxHashSet::from_iter(codegen_backend.fallback_intrinsics());
             sess.thin_lto_supported = codegen_backend.thin_lto_supported();
 
             let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
             let mut cfg = config::build_configuration(&sess, cfg);
             util::add_configuration(&mut cfg, &mut sess, &*codegen_backend);
-            sess.psess.config = cfg;
+            sess.config = cfg;
 
             let mut check_cfg = parse_check_cfg(sess.dcx(), config.crate_check_cfg);
             check_cfg.fill_well_known(&sess.target);
-            sess.psess.check_config = check_cfg;
+            sess.check_config = check_cfg;
 
             if let Some(psess_created) = config.psess_created {
                 psess_created(&mut sess.psess);
@@ -482,7 +477,6 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 codegen_backend,
                 override_queries: config.override_queries,
                 current_gcx,
-                jobserver_proxy,
             };
 
             // There are two paths out of `f`.

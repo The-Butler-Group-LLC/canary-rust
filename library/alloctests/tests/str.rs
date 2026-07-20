@@ -164,7 +164,7 @@ fn test_join_for_different_lengths_with_long_separator() {
 }
 
 #[test]
-fn test_join_issue_80335() {
+fn test_join_inconsistent_borrow_shrink() {
     use core::borrow::Borrow;
     use core::cell::Cell;
 
@@ -191,12 +191,12 @@ fn test_join_issue_80335() {
     }
 
     let arr: [WeirdBorrow; 3] = Default::default();
-    test_join!("0-0-0", arr, "-");
+    test_join!("123456-0-0", arr, "-");
 }
 
 #[test]
-#[should_panic(expected = "inconsistent Borrow implementation")]
-fn test_join_inconsistent_borrow() {
+#[should_panic(expected = "mid > len")]
+fn test_join_inconsistent_borrow_grow() {
     use std::borrow::Borrow;
     use std::cell::Cell;
 
@@ -1786,6 +1786,21 @@ fn test_utf16_size_hint() {
 }
 
 #[test]
+fn test_utf16_count() {
+    assert_eq!("".encode_utf16().count(), 0);
+    assert_eq!("a".encode_utf16().count(), 1);
+    assert_eq!("é".encode_utf16().count(), 1);
+    assert_eq!("字".encode_utf16().count(), 1);
+    assert_eq!("\u{1F4A9}".encode_utf16().count(), 2);
+    let mut iter = "\u{1F4A9}字éa".encode_utf16();
+    assert_eq!(iter.clone().count(), 5);
+    iter.next();
+    assert_eq!(iter.clone().count(), 4); // counting half of the surrogate pair
+    iter.next();
+    assert_eq!(iter.count(), 3);
+}
+
+#[test]
 fn starts_with_in_unicode() {
     assert!(!"├── Cargo.toml".starts_with("# "));
 }
@@ -1886,7 +1901,13 @@ fn to_lowercase() {
 #[test]
 fn to_uppercase() {
     assert_eq!("".to_uppercase(), "");
-    assert_eq!("aéǅßﬁᾀ".to_uppercase(), "AÉǄSSFIἈΙ");
+    assert_eq!("aéǅßẞﬁᾀ".to_uppercase(), "AÉǄSSẞFIἈΙ");
+}
+
+#[test]
+fn to_casefold_unnormalized() {
+    assert_eq!("".to_casefold_unnormalized(), "");
+    assert_eq!("ꮿﬁῲὼ\u{0345}ßẞΣς".to_casefold_unnormalized(), "Ꮿfiὼιὼιssssσσ");
 }
 
 #[test]
@@ -2348,6 +2369,7 @@ fn utf8_char_counts() {
         .flat_map(|n| n - spread..=n + spread)
         .collect::<Vec<usize>>();
     if cfg!(not(miri)) {
+        // Miri is too slow
         reps.extend([1024, 1 << 16].iter().copied().flat_map(|n| n - spread..=n + spread));
     }
     let counts = if cfg!(miri) { 0..1 } else { 0..8 };
@@ -2424,6 +2446,16 @@ fn floor_char_boundary() {
     check_many("🇯🇵", 0..4, 0);
     check_many("🇯🇵", 4..8, 4);
     check_many("🇯🇵", 8..10, 8);
+
+    // anticipate length- and index-based specializations
+    let s = "jpĵƥ日本🇯🇵jpĵƥ日本🇯🇵";
+    let expected = [
+        0, 1, 2, 2, 4, 4, 6, 6, 6, 9, 9, 9, 12, 12, 12, 12, 16, 16, 16, 16, 20, 21, 22, 22, 24, 24,
+        26, 26, 26, 29, 29, 29, 32, 32, 32, 32, 36, 36, 36, 36, 40, 40, 40, 40,
+    ];
+    for (idx, &ret) in expected.iter().enumerate() {
+        check_many(s, [idx], ret);
+    }
 }
 
 #[test]
@@ -2470,4 +2502,14 @@ fn ceil_char_boundary() {
 
     // above len
     check_many("hello", 5..=10, 5);
+
+    // anticipate length- and index-based specializations
+    let s = "jpĵƥ日本🇯🇵jpĵƥ日本🇯🇵";
+    let expected = [
+        0, 1, 2, 4, 4, 6, 6, 9, 9, 9, 12, 12, 12, 16, 16, 16, 16, 20, 20, 20, 20, 21, 22, 24, 24,
+        26, 26, 29, 29, 29, 32, 32, 32, 36, 36, 36, 36, 40, 40, 40, 40, 40, 40, 40,
+    ];
+    for (idx, &ret) in expected.iter().enumerate() {
+        check_many(s, [idx], ret);
+    }
 }

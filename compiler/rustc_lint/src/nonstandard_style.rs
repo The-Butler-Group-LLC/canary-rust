@@ -169,14 +169,12 @@ impl EarlyLintPass for NonCamelCaseTypes {
         }
 
         match &it.kind {
-            ast::ItemKind::TyAlias(box ast::TyAlias { ident, .. })
+            ast::ItemKind::TyAlias(ast::TyAlias { ident, .. })
             | ast::ItemKind::Enum(ident, ..)
             | ast::ItemKind::Struct(ident, ..)
             | ast::ItemKind::Union(ident, ..) => self.check_case(cx, "type", ident),
-            ast::ItemKind::Trait(box ast::Trait { ident, .. }) => {
-                self.check_case(cx, "trait", ident)
-            }
-            ast::ItemKind::TraitAlias(box ast::TraitAlias { ident, .. }) => {
+            ast::ItemKind::Trait(ast::Trait { ident, .. }) => self.check_case(cx, "trait", ident),
+            ast::ItemKind::TraitAlias(ast::TraitAlias { ident, .. }) => {
                 self.check_case(cx, "trait alias", ident)
             }
 
@@ -213,7 +211,7 @@ impl EarlyLintPass for NonCamelCaseTypes {
 
 declare_lint! {
     /// The `non_snake_case` lint detects variables, methods, functions,
-    /// lifetime parameters and modules that don't have snake case names.
+    /// lifetime parameters, named fields and modules that don't have snake case names.
     ///
     /// ### Example
     ///
@@ -313,18 +311,18 @@ impl NonSnakeCase {
                                 suggestion: sc_ident,
                             }
                         } else {
-                            NonSnakeCaseDiagSub::SuggestionAndNote { span }
+                            NonSnakeCaseDiagSub::SuggestionAndNote { sc, span }
                         }
                     } else {
-                        NonSnakeCaseDiagSub::ConvertSuggestion { span, suggestion: sc.clone() }
+                        NonSnakeCaseDiagSub::ConvertSuggestion { span, suggestion: sc }
                     }
                 } else {
-                    NonSnakeCaseDiagSub::Help
+                    NonSnakeCaseDiagSub::Help { sc }
                 }
             } else {
                 NonSnakeCaseDiagSub::Label { span }
             };
-            cx.emit_span_lint(NON_SNAKE_CASE, span, NonSnakeCaseDiag { sort, name, sc, sub });
+            cx.emit_span_lint(NON_SNAKE_CASE, span, NonSnakeCaseDiag { sort, name, sub });
         }
     }
 }
@@ -454,10 +452,8 @@ impl<'tcx> LateLintPass<'tcx> for NonSnakeCase {
         }
     }
 
-    fn check_struct_def(&mut self, cx: &LateContext<'_>, s: &hir::VariantData<'_>) {
-        for sf in s.fields() {
-            self.check_snake_case(cx, "structure field", &sf.ident);
-        }
+    fn check_field_def(&mut self, cx: &LateContext<'_>, field: &hir::FieldDef<'_>) {
+        self.check_snake_case(cx, "structure field", &field.ident);
     }
 }
 

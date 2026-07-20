@@ -170,7 +170,13 @@ fn get_callee_span_generic_args_and_args<'tcx>(
         && let callee_ty = cx.typeck_results().expr_ty(callee)
         && let ty::FnDef(callee_def_id, generic_args) = callee_ty.kind()
     {
-        return Some((*callee_def_id, callee.span, generic_args, None, args));
+        return Some((
+            *callee_def_id,
+            callee.span,
+            generic_args.no_bound_vars().unwrap(),
+            None,
+            args,
+        ));
     }
     if let ExprKind::MethodCall(segment, recv, args, _) = expr.kind
         && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
@@ -369,7 +375,12 @@ declare_tool_lint! {
     report_in_external_macro: true
 }
 
-declare_lint_pass!(TypeIr => [DIRECT_USE_OF_RUSTC_TYPE_IR, NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT, USAGE_OF_TYPE_IR_INHERENT, USAGE_OF_TYPE_IR_TRAITS]);
+declare_lint_pass!(TypeIr => [
+    DIRECT_USE_OF_RUSTC_TYPE_IR,
+    NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT,
+    USAGE_OF_TYPE_IR_INHERENT,
+    USAGE_OF_TYPE_IR_TRAITS
+]);
 
 impl<'tcx> LateLintPass<'tcx> for TypeIr {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
@@ -561,8 +572,6 @@ fn is_span_ctxt_call(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
 declare_tool_lint! {
     /// The `symbol_intern_string_literal` detects `Symbol::intern` being called on a string literal
     pub rustc::SYMBOL_INTERN_STRING_LITERAL,
-    // rustc_driver crates out of the compiler can't/shouldn't add preinterned symbols;
-    // bootstrap will deny this manually
     Allow,
     "Forbid uses of string literals in `Symbol::intern`, suggesting preinterning instead",
     report_in_external_macro: true

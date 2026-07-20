@@ -79,8 +79,8 @@ pub struct Declaration {
 //
 // Special handling for constructors:
 // - When the cursor is on `{`, `(`, or `;` in a struct/enum definition
-// - When the cursor is on the type name in a struct/enum definition
 // These cases will show only constructor/initialization usages of the type
+// (for example, `S { .. }`, `S(..)`, or `S`) instead of every type reference.
 //
 // | Editor  | Shortcut |
 // |---------|----------|
@@ -580,6 +580,7 @@ pub fn also_calls_foo() {
 "#,
             false,
             false,
+            // FIXME: The ranges here are volatile when minicore changes, that's not good.
             expect![[r#"
                 foo Function FileId(1) 0..15 7..10
 
@@ -599,7 +600,7 @@ fn main() {
             false,
             false,
             expect![[r#"
-                Some Variant FileId(1) 5999..6031 6024..6028
+                Some Variant FileId(1) 6737..6769 6762..6766
 
                 FileId(0) 46..50
             "#]],
