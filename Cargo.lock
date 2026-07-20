@@ -1571,7 +1571,7 @@ dependencies = [
  "cargo_metadata 0.21.0",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -2455,7 +2455,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5094,7 +5094,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "term",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "toml 0.9.8",
  "tracing",
  "tracing-subscriber",
